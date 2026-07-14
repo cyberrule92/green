@@ -1,0 +1,20 @@
+models:
+  - type: main
+    engine: openai
+    model: gpt-3.5-turbo
+
+# Use programmable (action-based) rails so no external LLM is required
+# for guardrail evaluation.  The actual checks run in Python actions.
+
+rails:
+  input:
+    flows:
+      - check input safety
+
+  output:
+    flows:
+      - check output safety
+
+# Passthrough: the main inference is handled by the Adaptive Green AI
+# vLLM backend, not by NemoGuardrails' LLM call.  We only use NeMo for
+# the safety rail layer.

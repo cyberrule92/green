@@ -1,0 +1,118 @@
+<svg width="1280" height="760" viewBox="0 0 1280 760" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="1280" height="760" rx="28" fill="#F6FBFA"/>
+  <rect x="24" y="24" width="220" height="56" rx="18" fill="#FFE056"/>
+  <text x="44" y="60" font-family="Arial, sans-serif" font-size="34" font-weight="700" fill="#0A1F1E">Advanced RAG</text>
+
+  <circle cx="378" cy="56" r="18" fill="#18A957"/>
+  <text x="410" y="64" font-family="Arial, sans-serif" font-size="22" font-weight="600" fill="#0A1F1E">Preprocessing</text>
+  <circle cx="744" cy="56" r="18" fill="#0F4C9A"/>
+  <text x="776" y="64" font-family="Arial, sans-serif" font-size="22" font-weight="600" fill="#0A1F1E">Querying</text>
+
+  <rect x="24" y="96" width="1232" height="200" rx="24" fill="#E7F5EC"/>
+  <text x="40" y="138" font-family="Arial, sans-serif" font-size="42" font-weight="700" fill="#102E2C">Indexing</text>
+
+  <rect x="66" y="150" width="136" height="110" rx="22" fill="#FFFFFF" stroke="#233533" stroke-width="3"/>
+  <text x="86" y="186" font-family="Arial, sans-serif" font-size="24" fill="#1B2C2B">Documents</text>
+  <rect x="304" y="142" width="160" height="64" rx="16" fill="#FFFFFF" stroke="#233533" stroke-width="3"/>
+  <circle cx="334" cy="174" r="18" fill="#14A93A"/>
+  <text x="328" y="181" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#FFFFFF">1</text>
+  <text x="366" y="181" font-family="Arial, sans-serif" font-size="24" fill="#1B2C2B">Chunking</text>
+
+  <rect x="560" y="128" width="246" height="92" rx="18" fill="#FFFFFF" stroke="#233533" stroke-width="3"/>
+  <circle cx="592" cy="174" r="18" fill="#14A93A"/>
+  <text x="586" y="181" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#FFFFFF">2</text>
+  <text x="626" y="168" font-family="Arial, sans-serif" font-size="22" fill="#1B2C2B">Embedding</text>
+  <text x="626" y="195" font-family="Arial, sans-serif" font-size="22" fill="#1B2C2B">Model</text>
+
+  <rect x="352" y="216" width="180" height="120" rx="18" fill="#FFFFFF" stroke="#233533" stroke-width="3"/>
+  <text x="396" y="272" font-family="Arial, sans-serif" font-size="30" fill="#1B2C2B">Vector DB</text>
+
+  <rect x="584" y="232" width="200" height="58" rx="16" fill="#FFFFFF" stroke="#233533" stroke-width="3"/>
+  <circle cx="616" cy="261" r="18" fill="#14A93A"/>
+  <text x="610" y="268" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#FFFFFF">3</text>
+  <text x="648" y="268" font-family="Arial, sans-serif" font-size="22" fill="#1B2C2B">Insertion</text>
+
+  <rect x="856" y="126" width="322" height="64" rx="16" fill="#FFFFFF" stroke="#233533" stroke-width="3"/>
+  <text x="900" y="166" font-family="Arial, sans-serif" font-size="22" fill="#1B2C2B">Metadata Enrichment</text>
+  <rect x="856" y="204" width="322" height="82" rx="16" fill="#FFFFFF" stroke="#233533" stroke-width="3"/>
+  <text x="902" y="241" font-family="Arial, sans-serif" font-size="22" fill="#1B2C2B">Hybrid Indexing</text>
+  <text x="928" y="268" font-family="Arial, sans-serif" font-size="22" fill="#1B2C2B">(Dense + Sparse)</text>
+
+  <rect x="24" y="318" width="1232" height="210" rx="24" fill="#E9F1FF"/>
+  <text x="40" y="360" font-family="Arial, sans-serif" font-size="42" font-weight="700" fill="#102E2C">Retrieval</text>
+
+  <rect x="52" y="374" width="176" height="122" rx="22" fill="#FFFFFF" stroke="#233533" stroke-width="3"/>
+  <text x="86" y="428" font-family="Arial, sans-serif" font-size="24" fill="#1B2C2B">User Query</text>
+
+  <rect x="290" y="388" width="204" height="88" rx="18" fill="#FFFFFF" stroke="#233533" stroke-width="3"/>
+  <circle cx="322" cy="432" r="18" fill="#0F4C9A"/>
+  <text x="316" y="439" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#FFFFFF">4</text>
+  <text x="354" y="427" font-family="Arial, sans-serif" font-size="22" fill="#1B2C2B">Query</text>
+  <text x="354" y="455" font-family="Arial, sans-serif" font-size="22" fill="#1B2C2B">Embedding</text>
+
+  <circle cx="560" cy="476" r="18" fill="#0F4C9A"/>
+  <text x="554" y="483" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#FFFFFF">5</text>
+  <text x="592" y="483" font-family="Arial, sans-serif" font-size="22" fill="#1B2C2B">Similarity Search</text>
+
+  <rect x="618" y="378" width="252" height="104" rx="18" fill="#FFFFFF" stroke="#233533" stroke-width="3"/>
+  <circle cx="650" cy="428" r="18" fill="#0F4C9A"/>
+  <text x="644" y="435" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#FFFFFF">6</text>
+  <text x="684" y="420" font-family="Arial, sans-serif" font-size="22" fill="#1B2C2B">Top-K Retrieval</text>
+  <text x="684" y="448" font-family="Arial, sans-serif" font-size="22" fill="#1B2C2B">(Dense / Sparse)</text>
+
+  <rect x="904" y="368" width="172" height="56" rx="16" fill="#FFFFFF" stroke="#233533" stroke-width="3"/>
+  <circle cx="934" cy="396" r="18" fill="#0F4C9A"/>
+  <text x="928" y="403" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#FFFFFF">7</text>
+  <text x="966" y="403" font-family="Arial, sans-serif" font-size="22" fill="#1B2C2B">Reranker</text>
+
+  <rect x="904" y="436" width="212" height="64" rx="16" fill="#FFFFFF" stroke="#233533" stroke-width="3"/>
+  <circle cx="934" cy="468" r="18" fill="#0F4C9A"/>
+  <text x="928" y="475" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#FFFFFF">8</text>
+  <text x="966" y="474" font-family="Arial, sans-serif" font-size="22" fill="#1B2C2B">Relevance Filter</text>
+
+  <rect x="1140" y="404" width="104" height="88" rx="16" fill="#FFFFFF" stroke="#233533" stroke-width="3"/>
+  <circle cx="1168" cy="430" r="18" fill="#0F4C9A"/>
+  <text x="1162" y="437" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#FFFFFF">9</text>
+  <text x="1156" y="460" font-family="Arial, sans-serif" font-size="20" fill="#1B2C2B">Context</text>
+  <text x="1159" y="486" font-family="Arial, sans-serif" font-size="20" fill="#1B2C2B">Fusion</text>
+
+  <rect x="24" y="550" width="1232" height="182" rx="24" fill="#F8EAF6"/>
+  <text x="40" y="592" font-family="Arial, sans-serif" font-size="42" font-weight="700" fill="#102E2C">Generation</text>
+
+  <rect x="460" y="604" width="276" height="60" rx="18" fill="#FFFFFF" stroke="#233533" stroke-width="3"/>
+  <circle cx="492" cy="634" r="18" fill="#0F4C9A"/>
+  <text x="484" y="641" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#FFFFFF">10</text>
+  <text x="526" y="641" font-family="Arial, sans-serif" font-size="22" fill="#1B2C2B">Prompt Construction</text>
+
+  <rect x="560" y="682" width="212" height="42" rx="16" fill="#FFFFFF" stroke="#233533" stroke-width="3"/>
+  <circle cx="590" cy="703" r="18" fill="#0F4C9A"/>
+  <text x="581" y="710" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#FFFFFF">11</text>
+  <text x="624" y="710" font-family="Arial, sans-serif" font-size="22" fill="#1B2C2B">Generation</text>
+
+  <rect x="312" y="682" width="220" height="42" rx="16" fill="#FFFFFF" stroke="#233533" stroke-width="3"/>
+  <circle cx="342" cy="703" r="18" fill="#0F4C9A"/>
+  <text x="333" y="710" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#FFFFFF">12</text>
+  <text x="376" y="710" font-family="Arial, sans-serif" font-size="22" fill="#1B2C2B">Answer Synthesis</text>
+
+  <rect x="790" y="612" width="150" height="84" rx="18" fill="#FFFFFF" stroke="#233533" stroke-width="3"/>
+  <text x="846" y="659" text-anchor="middle" font-family="Arial, sans-serif" font-size="24" font-weight="700" fill="#1B2C2B">LLM</text>
+
+  <rect x="966" y="610" width="196" height="88" rx="18" fill="#FFFFFF" stroke="#233533" stroke-width="3"/>
+  <text x="1006" y="650" font-family="Arial, sans-serif" font-size="22" fill="#1B2C2B">Retrieved</text>
+  <text x="1006" y="678" font-family="Arial, sans-serif" font-size="22" fill="#1B2C2B">Context</text>
+
+  <rect x="82" y="624" width="168" height="72" rx="18" fill="#FFFFFF" stroke="#233533" stroke-width="3"/>
+  <text x="132" y="668" font-family="Arial, sans-serif" font-size="22" fill="#1B2C2B">Response</text>
+
+  <path d="M202 205H304" stroke="#233533" stroke-width="4"/>
+  <path d="M464 174H560" stroke="#233533" stroke-width="4"/>
+  <path d="M442 336V388" stroke="#233533" stroke-width="4"/>
+  <path d="M494 432H618" stroke="#233533" stroke-width="4"/>
+  <path d="M870 430H904" stroke="#233533" stroke-width="4"/>
+  <path d="M1076 396H1140" stroke="#233533" stroke-width="4"/>
+  <path d="M1120 468H1140" stroke="#233533" stroke-width="4"/>
+  <path d="M684 664H790" stroke="#233533" stroke-width="4"/>
+  <path d="M940 652H966" stroke="#233533" stroke-width="4"/>
+  <path d="M790 703H532" stroke="#233533" stroke-width="4"/>
+  <path d="M312 703H250" stroke="#233533" stroke-width="4"/>
+</svg>

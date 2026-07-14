@@ -1,0 +1,257 @@
+@startuml Adaptive_Green_AI_ArchiMate
+'==============================================================================
+' Adaptive Green AI — Carbon-aware LLM orchestration platform
+' ArchiMate 3.x model (PlantUML, archimate stdlib)
+'
+' Render:  plantuml architecture_archimate.puml          (-> PNG)
+'          plantuml -tsvg architecture_archimate.puml     (-> SVG)
+'
+' Layers, top -> bottom:
+'   Motivation  -> why the platform exists
+'   Strategy    -> capabilities that deliver it
+'   Business    -> services consumed by people / tenants
+'   Application -> the FastAPI control plane + supporting modules + UI
+'   Technology  -> containers, vLLM endpoints, hardware, external APIs
+'   Implementation -> roadmap (planned, not yet shipped)
+'==============================================================================
+!include <archimate/Archimate>
+
+title Adaptive Green AI — Complete Solution (ArchiMate)
+
+skinparam rectangle {
+  BorderColor #6b7280
+  FontStyle bold
+}
+skinparam defaultTextAlignment center
+left to right direction
+
+'==============================================================================
+' MOTIVATION — drivers, goals, principles, requirements
+'==============================================================================
+rectangle "Motivation" as MOT #E5D5F0 {
+  Motivation_Driver(drv_carbon,        "Reduce AI carbon footprint")
+  Motivation_Stakeholder(stk_esg,      "ESG / Sustainability mandate")
+  Motivation_Goal(goal_green,          "Carbon-aware, SLA-respecting LLM serving")
+  Motivation_Principle(prin_green,     "Green routing:\ngreenest feasible candidate wins")
+  Motivation_Requirement(req_css,      "Per-request CSS optimisation\n(carbon · latency · accuracy · cost)")
+  Motivation_Requirement(req_safety,   "Input/output safety guardrails")
+  Motivation_Requirement(req_audit,    "Signed, auditable decisions")
+}
+
+'==============================================================================
+' STRATEGY — capabilities & resources
+'==============================================================================
+rectangle "Strategy" as STR #F5E1C0 {
+  Strategy_Capability(cap_orch,    "Carbon-aware orchestration")
+  Strategy_Capability(cap_route,   "Adaptive multi-model routing (MoE)")
+  Strategy_Capability(cap_learn,   "Self-learning routing policy (RL)")
+  Strategy_Capability(cap_defer,   "Temporal carbon shifting (EcoServe)")
+  Strategy_Resource(res_gpu,       "GPU / vGPU fleet")
+  Strategy_Resource(res_grid,      "Real-time grid-carbon signal")
+}
+
+'==============================================================================
+' BUSINESS — actors, services, processes, objects
+'==============================================================================
+rectangle "Business" as BIZ #FFF6CC {
+  Business_Actor(act_user,     "End User")
+  Business_Actor(act_tenant,   "Tenant (multi-tenant)")
+  Business_Actor(act_esg,      "Sustainability Officer")
+  Business_Actor(act_admin,    "Platform Operator / Admin")
+
+  Business_Service(bsvc_chat,   "Conversational AI service")
+  Business_Service(bsvc_report, "Sustainability reporting (CSRD)")
+  Business_Service(bsvc_audit,  "Audit & compliance service")
+  Business_Service(bsvc_budget, "Tenant budget management")
+
+  Business_Process(bproc_ask,    "Submit chat request")
+  Business_Process(bproc_review, "Review carbon dashboard")
+  Business_Process(bproc_govern, "Govern budgets & policies")
+
+  Business_Object(bobj_conv,   "Conversation")
+  Business_Object(bobj_audit,  "Audit record")
+  Business_Object(bobj_csrd,   "CSRD report")
+}
+
+'==============================================================================
+' APPLICATION — UI, control plane, supporting services, data
+'==============================================================================
+rectangle "Application" as APP #D6F0FF {
+
+  ' --- Presentation ---
+  Application_Component(app_ui,   "React UI (GreenAIChat)\nGrommet / HPE")
+  Application_Interface(app_apii, "REST /api/* (FastAPI)")
+
+  ' --- Control plane ---
+  Application_Component(app_engine, "decision_engine.py\nControl plane · 26 endpoints")
+  Application_Service(asvc_chat,    "Chat orchestration\n/api/chat")
+
+  ' --- Pipeline stages (in execution order) ---
+  Application_Component(app_guard,  "nemo_guardrails.py\nInput/output rails")
+  Application_Component(app_cache,  "semantic_cache.py\nNear-duplicate skip")
+  Application_Component(app_rag,    "advanced_rag.py\nHybrid dense+sparse · rerank")
+  Application_Component(app_policy, "routing_policies.py\nProfiler · CSS · MoE FLOPs")
+  Application_Component(app_rl,     "rl_controller.py\nOnline REINFORCE + EMA")
+  Application_Component(app_queue,  "deferred_queue.py\nEcoServe carbon deferral")
+  Application_Component(app_zoo,    "model_zoo.py\nLLMCarbon registry")
+  Application_Component(app_mon,    "monitoring_layer.py\nGrid + GPU/CPU metrics")
+
+  ' --- Cross-cutting / persistence ---
+  Application_Component(app_store,  "conversation_store.py\nSQLite WAL")
+  Application_Component(app_budget, "budgets.py")
+  Application_Component(app_tenant, "tenancy.py")
+  Application_Component(app_csrd,   "csrd_reporting.py")
+
+  ' --- Data objects ---
+  Application_DataObject(do_db,    "green_ai.db\n(conversations · messages)")
+  Application_DataObject(do_rag,   "rag_store.json")
+  Application_DataObject(do_rl,    "rl_state.json")
+  Application_DataObject(do_log,   "decision_logs.jsonl\n(HMAC-signed)")
+  Application_DataObject(do_cfg,   "config/*.json\npolicies · routing · zoo")
+}
+
+'==============================================================================
+' TECHNOLOGY — runtime, containers, hardware, external systems
+'==============================================================================
+rectangle "Technology" as TEC #D6F5D6 {
+  Technology_Node(tec_caddy,   "Caddy edge\n(HTTPS, optional)")
+  Technology_Node(tec_api,     "Uvicorn :8100\nAPI server")
+  Technology_Node(tec_sidecar, "Host metrics sidecar :9000\nhost_metrics_service.py")
+  Technology_SystemSoftware(tec_compose, "Docker Compose / Kubernetes\n(NVIDIA GPU Operator)")
+
+  Technology_Service(tec_vmed,  "vLLM medium :8001\nTinyLlama-1.1B")
+  Technology_Service(tec_vfull, "vLLM full :8002\nQwen2.5-1.5B")
+  Technology_Service(tec_vmoe,  "vLLM MoE\nQwen3-30B-A3B")
+  Technology_Service(tec_vstem, "vLLM STEM\nMath / Science / Coding")
+  Technology_Service(tec_vcpu,  "vLLM CPU fallback\nLlama2-7B")
+
+  Technology_Device(tec_gpu,   "GPU / vGPU hardware")
+  Technology_Artifact(tec_smetrics, "system_metrics.sh\nnvidia-smi / top")
+
+  ' External systems
+  Technology_Service(ext_emap, "Electricity Maps API\nreal-time + 48h forecast")
+  Technology_Service(ext_hf,   "Hugging Face Hub\nmodel cache")
+}
+
+'==============================================================================
+' IMPLEMENTATION & MIGRATION — roadmap (not yet shipped)
+'==============================================================================
+rectangle "Implementation (planned)" as IMP #FFE0E0 {
+  Implementation_WorkPackage(wp_critic, "Critic / validation expert\n(accuracy · completeness · objectivity)")
+  Implementation_Plateau(plat_next,     "Next plateau:\nself-validating MoE output")
+}
+
+'==============================================================================
+' RELATIONSHIPS
+'==============================================================================
+
+' --- Motivation chain ---
+Rel_Influence(stk_esg, drv_carbon)
+Rel_Influence(drv_carbon, goal_green)
+Rel_Realization(prin_green, goal_green)
+Rel_Realization(req_css, goal_green)
+Rel_Realization(req_safety, goal_green)
+Rel_Realization(req_audit, goal_green)
+
+' --- Strategy realises motivation ---
+Rel_Realization(cap_orch, goal_green)
+Rel_Realization(cap_route, req_css)
+Rel_Realization(cap_learn, req_css)
+Rel_Realization(cap_defer, drv_carbon)
+Rel_Assignment(res_gpu, cap_route)
+Rel_Assignment(res_grid, cap_orch)
+
+' --- Business serves actors ---
+Rel_Serving(bsvc_chat, act_user)
+Rel_Serving(bsvc_report, act_esg)
+Rel_Serving(bsvc_audit, act_admin)
+Rel_Serving(bsvc_budget, act_tenant)
+Rel_Assignment(act_user, bproc_ask)
+Rel_Assignment(act_esg, bproc_review)
+Rel_Assignment(act_admin, bproc_govern)
+Rel_Realization(bproc_ask, bsvc_chat)
+Rel_Realization(bproc_review, bsvc_report)
+Rel_Realization(bproc_govern, bsvc_budget)
+Rel_Access(bproc_ask, bobj_conv)
+Rel_Access(bsvc_audit, bobj_audit)
+Rel_Access(bsvc_report, bobj_csrd)
+
+' --- Strategy realised by application capability ---
+Rel_Realization(asvc_chat, cap_orch)
+
+' --- Application layer supports business ---
+Rel_Serving(asvc_chat, bsvc_chat)
+Rel_Serving(app_csrd, bsvc_report)
+Rel_Serving(app_budget, bsvc_budget)
+Rel_Serving(app_engine, bsvc_audit)
+
+' --- UI -> API ---
+Rel_Serving(app_apii, app_ui)
+Rel_Serving(app_ui, act_user)
+Rel_Composition(app_engine, app_apii)
+Rel_Realization(app_engine, asvc_chat)
+
+' --- Request lifecycle (/api/chat) as a flow through the control plane ---
+Rel_Triggering(app_apii, app_guard)
+Rel_Flow(app_guard, app_cache, "1. input rails")
+Rel_Flow(app_cache, app_rag, "2. cache miss")
+Rel_Flow(app_rag, app_policy, "3. retrieve + rerank")
+Rel_Flow(app_policy, app_queue, "4. profile + CSS rank")
+Rel_Flow(app_queue, app_engine, "5. EcoServe gate")
+Rel_Flow(app_engine, app_guard, "6. dispatch -> 7. output rails")
+Rel_Flow(app_engine, app_rl, "9. reward")
+Rel_Flow(app_engine, app_store, "10. persist")
+
+' --- Control plane uses supporting components ---
+Rel_Serving(app_policy, app_engine)
+Rel_Serving(app_rl, app_policy)
+Rel_Serving(app_zoo, app_policy)
+Rel_Serving(app_mon, app_policy)
+Rel_Serving(app_mon, app_queue)
+Rel_Serving(app_tenant, app_engine)
+Rel_Serving(app_budget, app_engine)
+
+' --- Data access ---
+Rel_Access(app_store, do_db)
+Rel_Access(app_rag, do_rag)
+Rel_Access(app_rl, do_rl)
+Rel_Access(app_engine, do_log)
+Rel_Access(app_policy, do_cfg)
+Rel_Access(app_zoo, do_cfg)
+
+' --- Application deployed on / served by Technology ---
+Rel_Assignment(tec_api, app_engine)
+Rel_Assignment(tec_api, app_ui)
+Rel_Serving(tec_caddy, tec_api)
+Rel_Serving(tec_sidecar, app_mon)
+Rel_Composition(tec_compose, tec_api)
+Rel_Composition(tec_compose, tec_sidecar)
+Rel_Composition(tec_compose, tec_vmed)
+Rel_Composition(tec_compose, tec_vfull)
+Rel_Composition(tec_compose, tec_vmoe)
+Rel_Composition(tec_compose, tec_vstem)
+Rel_Composition(tec_compose, tec_vcpu)
+
+' --- Inference dispatch targets ---
+Rel_Serving(tec_vmed, app_engine)
+Rel_Serving(tec_vfull, app_engine)
+Rel_Serving(tec_vmoe, app_engine)
+Rel_Serving(tec_vstem, app_engine)
+Rel_Serving(tec_vcpu, app_engine)
+Rel_Assignment(tec_gpu, tec_vfull)
+Rel_Assignment(tec_gpu, tec_vmoe)
+Rel_Assignment(tec_gpu, tec_vstem)
+Rel_Serving(tec_smetrics, tec_sidecar)
+Rel_Assignment(tec_gpu, tec_smetrics)
+
+' --- External systems ---
+Rel_Serving(ext_emap, app_mon)
+Rel_Serving(ext_hf, tec_vfull)
+Rel_Realization(res_grid, ext_emap)
+Rel_Realization(res_gpu, tec_gpu)
+
+' --- Roadmap: critic extends the chat orchestration ---
+Rel_Realization(wp_critic, plat_next)
+Rel_Association(wp_critic, asvc_chat)
+
+@enduml

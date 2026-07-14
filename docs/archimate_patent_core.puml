@@ -1,0 +1,113 @@
+@startuml Adaptive_Green_AI_Patent_Core
+'==============================================================================
+' Adaptive Green AI — PATENT INVENTIVE-CORE ArchiMate view
+' Isolates the six claimed mechanisms (M1..M6) and the closed feedback loop.
+' Full model: architecture_archimate.puml
+'
+' Render:  plantuml docs/archimate_patent_core.puml          (-> PNG)
+'          plantuml -tsvg docs/archimate_patent_core.puml     (-> SVG)
+'==============================================================================
+!include <archimate/Archimate>
+
+title Adaptive Green AI — Patent Inventive Core (M1..M6)
+
+skinparam rectangle { BorderColor #6b7280  FontStyle bold }
+skinparam defaultTextAlignment center
+left to right direction
+
+'==============================================================================
+' MOTIVATION
+'==============================================================================
+rectangle "Motivation" as MOT #E5D5F0 {
+  Motivation_Driver(drv,        "Reduce AI carbon footprint")
+  Motivation_Requirement(req_css,  "Per-request CSS optimisation\n(carbon|latency|accuracy|cost)")
+  Motivation_Requirement(req_learn,"Self-adapting, per-tenant policy")
+  Motivation_Requirement(req_shift,"Exploit temporal+spatial carbon variability")
+  Motivation_Requirement(req_audit,"Signed, replayable carbon evidence")
+}
+
+'==============================================================================
+' STRATEGY — the inventive capabilities
+'==============================================================================
+rectangle "Strategy (capabilities)" as STR #F5E1C0 {
+  Strategy_Capability(cap_route,  "M1 Carbon-dominant\nmulti-model routing (CSS)")
+  Strategy_Capability(cap_carbon, "M2 Live dual carbon model\n(operational + embodied)")
+  Strategy_Capability(cap_learn,  "M3 Online RL of\nper-tier routing weights")
+  Strategy_Capability(cap_shift,  "M4 EcoServe carbon shifting\n(defer + reroute)")
+  Strategy_Capability(cap_prof,   "M5 Minimum-capability\nprompt profiling")
+  Strategy_Capability(cap_audit,  "M6 Signed decision ledger")
+}
+
+'==============================================================================
+' APPLICATION — components realising the mechanisms
+'==============================================================================
+rectangle "Application (control plane)" as APP #D6F0FF {
+  Application_Component(app_prof,  "routing_policies\ninfer_prompt_profile (M5)")
+  Application_Component(app_css,   "routing_policies\nrank_routing_candidates (M1)")
+  Application_Component(app_carb,  "routing_policies\nLLMCarbon op+embodied (M2)")
+  Application_Component(app_rl,    "rl_controller\nREINFORCE + EMA (M3)")
+  Application_Component(app_eco,   "deferred_queue +\nevaluate_ecoserve_actions (M4)")
+  Application_Component(app_mon,   "monitoring_layer\nfind_low_carbon_window")
+  Application_Component(app_zoo,   "model_zoo\nLLMCarbon registry + MoE placement")
+  Application_Component(app_aud,   "decision_engine\nHMAC audit writer (M6)")
+
+  Application_DataObject(do_pol,   "rl_state.json\nlearned per-tier weights")
+  Application_DataObject(do_log,   "decision_logs.jsonl\n(HMAC-signed ledger)")
+  Application_DataObject(do_cfg,   "policies.json | model_zoo.json\n(priors + carbon params)")
+}
+
+'==============================================================================
+' TECHNOLOGY
+'==============================================================================
+rectangle "Technology" as TEC #D6F5D6 {
+  Technology_Service(ext_emap, "Electricity Maps API\nlive CI + 48h forecast")
+  Technology_Service(tec_vllm, "vLLM endpoints\nmedium|full|stem")
+  Technology_Service(tec_side, "Host metrics sidecar\nGPU/CPU power")
+  Technology_Device(tec_gpu,   "GPU / vGPU fleet")
+}
+
+'==============================================================================
+' RELATIONSHIPS — motivation -> strategy -> application -> technology
+'==============================================================================
+Rel_Realization(cap_route, req_css)
+Rel_Realization(cap_carbon, req_css)
+Rel_Realization(cap_learn, req_learn)
+Rel_Realization(cap_shift, req_shift)
+Rel_Realization(cap_audit, req_audit)
+Rel_Influence(drv, req_css)
+Rel_Influence(drv, req_shift)
+
+Rel_Realization(app_css, cap_route)
+Rel_Realization(app_carb, cap_carbon)
+Rel_Realization(app_rl, cap_learn)
+Rel_Realization(app_eco, cap_shift)
+Rel_Realization(app_prof, cap_prof)
+Rel_Realization(app_aud, cap_audit)
+
+'==============================================================================
+' THE CLOSED FEEDBACK LOOP (the system claim)
+'==============================================================================
+Rel_Flow(app_prof, app_css, "min-capability variant")
+Rel_Flow(app_carb, app_css, "op_g + emb_g per candidate")
+Rel_Flow(app_rl,  app_css, "per-tier weights")
+Rel_Flow(app_css, app_eco, "selected candidate")
+Rel_Flow(app_eco, tec_vllm, "dispatch now / on window")
+Rel_Flow(tec_vllm, app_aud, "observed latency|carbon|accuracy")
+Rel_Flow(app_aud, app_rl, "reward R -> online update")
+Rel_Access(app_rl, do_pol)
+Rel_Access(app_aud, do_log)
+Rel_Access(app_css, do_cfg)
+Rel_Access(app_carb, do_cfg)
+
+'==============================================================================
+' EXTERNAL SIGNALS feeding the carbon model
+'==============================================================================
+Rel_Serving(ext_emap, app_carb)
+Rel_Serving(ext_emap, app_mon)
+Rel_Serving(app_mon, app_eco)
+Rel_Serving(app_zoo, app_carb)
+Rel_Serving(tec_side, app_carb)
+Rel_Assignment(tec_gpu, tec_vllm)
+Rel_Serving(tec_side, app_mon)
+
+@enduml

@@ -1,0 +1,19 @@
+services:
+  edge:
+    image: caddy:2.8-alpine
+    depends_on:
+      - frontend
+    environment:
+      PUBLIC_HOSTNAME: ${PUBLIC_HOSTNAME}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    ports:
+      - "80:80"
+      - "443:443"
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:

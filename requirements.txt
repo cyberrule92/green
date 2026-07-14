@@ -1,0 +1,26 @@
+fastapi
+# nemoguardrails removed: not imported by any module in this repo. The local
+# nemo_guardrails.py is a self-contained shim; pulling the upstream package
+# dragged in langchain/openai and broke the metrics image build.
+# langgraph ONLY — do NOT add langchain/langchain-* here. langgraph's core graph
+# runtime does not need it (coding_agent.py binds run_vllm_inference directly as
+# a callable), and pulling langchain re-drags openai into the image, which is the
+# build break described above. coding_agent falls back to an internal executor if
+# this import ever fails, so the image still boots.
+langgraph
+pydantic
+pypdf
+pytest                 # the coding agent's sandbox verifier shells out to it;
+                       # without it every task returns harness_error (see
+                       # coding_agent.tool_run_tests)
+python-multipart
+requests
+sentence-transformers
+simpleeval
+urllib3>=1.26.0        # explicit dep — monitoring_layer imports urllib3.util.retry
+uvicorn[standard]
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-grpc
+opentelemetry-instrumentation-fastapi
+opentelemetry-instrumentation-logging

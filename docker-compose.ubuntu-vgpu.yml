@@ -1,0 +1,448 @@
+services:
+  vllm-medium:
+    image: vllm/vllm-openai:latest
+    command:
+      - --model=TinyLlama/TinyLlama-1.1B-Chat-v1.0
+      - --host=0.0.0.0
+      - --port=8001
+      # 0.12, not 0.25: TinyLlama-1.1B is ~2.2 GB of fp16 weights, so a quarter of
+      # a 24 GB slice was ~5 GB of KV cache this model cannot use at 2048 ctx. The
+      # reclaimed headroom is what lets the agent's coder-7b escalation rung fit.
+      - --gpu-memory-utilization=0.12
+      - --max-model-len=2048
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+    volumes:
+      - ./data/hf-cache:/root/.cache/huggingface
+    ports:
+      - "8001:8001"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    shm_size: "4gb"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8001/health"]
+      interval: 20s
+      timeout: 5s
+      start_period: 60s
+      retries: 5
+    restart: unless-stopped
+
+  vllm-full:
+    image: vllm/vllm-openai:latest
+    command:
+      - --model=Qwen/Qwen2.5-1.5B-Instruct
+      - --host=0.0.0.0
+      - --port=8002
+      # 0.20, not 0.22: at 0.22 vLLM allocated a 132,608-token KV cache for a
+      # 4096-token context — far more than this model can address. Trimming the
+      # surplus helps the agent's coder-7b rung fit on a 24 GB slice.
+      # Do NOT go below ~0.19: at 0.16 there is no room left for cache blocks
+      # after the weights and vLLM refuses to start ("No available memory for the
+      # cache blocks"), which takes the chat path down with it.
+      - --gpu-memory-utilization=0.20
+      - --max-model-len=4096
+      # Force the KV pool size. --gpu-memory-utilization alone did NOT bound it:
+      # vLLM sized the pool off free memory at startup and took a 148,944-token
+      # KV cache for a 4096-token context — 36x what this model can address, and
+      # ~4.3 GB of pure waste. 2048 blocks x 16 tokens = 32,768 tokens = 8
+      # concurrent full-length sequences, which is far more than this app runs.
+      # Reclaiming that surplus is what lets the agent's coder-7b rung fit.
+      - --num-gpu-blocks-override=2048
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+    volumes:
+      - ./data/hf-cache:/root/.cache/huggingface
+    ports:
+      - "8002:8002"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    shm_size: "4gb"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8002/health"]
+      interval: 20s
+      timeout: 5s
+      start_period: 60s
+      retries: 5
+    restart: unless-stopped
+
+  # Llama Guard 3 (1B) — dedicated safety classifier backing guardrail rail I.9.
+  # 1B fits the ~few-GB VRAM headroom the H100 slice has left after the medium/
+  # full serves; the 8B variant would not. Gated model: requires HF_TOKEN with
+  # the meta-llama/Llama-Guard-3-1B licence accepted. The API fails OPEN if this
+  # endpoint is unreachable, so a slow first-boot download never blocks traffic.
+  vllm-guard:
+    image: vllm/vllm-openai:latest
+    command:
+      - --model=meta-llama/Llama-Guard-3-1B
+      - --host=0.0.0.0
+      - --port=8008
+      # ~7GB free on the slice. 0.15 fit the 1B weights but left no KV cache
+      # ("No available memory for the cache blocks"). 0.25 (~6GB) + eager mode
+      # (no CUDA-graph capture) leaves ample KV for tiny classifier inputs while
+      # staying inside the free budget. max-num-seqs low: one short call at a time.
+      - --gpu-memory-utilization=0.25
+      - --max-model-len=2048
+      - --enforce-eager
+      - --max-num-seqs=2
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+    volumes:
+      - ./data/hf-cache:/root/.cache/huggingface
+    ports:
+      - "8008:8008"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    shm_size: "2gb"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8008/health"]
+      interval: 20s
+      timeout: 5s
+      start_period: 300s
+      retries: 10
+    restart: unless-stopped
+
+  # ── Optional dedicated containers (paper §3.3) ────────────────────────────
+  # The default stack runs only vllm-medium + vllm-full. Operators that want
+  # dedicated endpoints for MoE / STEM / Llama2-7B-fallback enable the
+  # corresponding profile, e.g.:
+  #   docker compose --profile moe --profile stem up -d
+  # All services below default to the same vllm-openai image, but the API
+  # resolves their URL from VLLM_MOE_URL / VLLM_STEM_*_URL / VLLM_FALLBACK_URL,
+  # so leaving them down is safe — the resolver falls back to vllm-full.
+
+  vllm-moe:
+    profiles: ["moe"]
+    image: vllm/vllm-openai:latest
+    command:
+      - --model=Qwen/Qwen3-30B-A3B
+      - --host=0.0.0.0
+      - --port=8003
+      - --gpu-memory-utilization=0.9
+      - --max-model-len=8192
+      - --tensor-parallel-size=${MOE_TP_SIZE:-1}
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+    volumes:
+      - ./data/hf-cache:/root/.cache/huggingface
+    ports:
+      - "8003:8003"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    shm_size: "8gb"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8003/health"]
+      interval: 20s
+      timeout: 5s
+      start_period: 120s
+      retries: 5
+    restart: unless-stopped
+
+  vllm-stem-math:
+    profiles: ["stem", "stem-math"]
+    image: vllm/vllm-openai:latest
+    command:
+      - --model=Qwen/Qwen2.5-Math-1.5B-Instruct
+      - --host=0.0.0.0
+      - --port=8004
+      - --gpu-memory-utilization=0.20
+      - --max-model-len=2048
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+    volumes:
+      - ./data/hf-cache:/root/.cache/huggingface
+    ports:
+      - "8004:8004"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    shm_size: "4gb"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8004/health"]
+      interval: 20s
+      timeout: 5s
+      start_period: 60s
+      retries: 5
+    restart: unless-stopped
+
+  # vllm-stem-science is intentionally NOT a separate container: it would serve
+  # the same Qwen2.5-1.5B-Instruct already hosted by vllm-full. We map
+  # VLLM_STEM_SCIENCE_URL → VLLM_FULL_URL in the api service so STEM-science
+  # routing dispatches to the full container with the matching model name (see
+  # the zoo entry's vllm_model_id, which is identical to vllm-full's --model).
+  # Bring up a dedicated container only if you need isolated GPU memory or a
+  # genuinely different science-tuned model.
+  vllm-stem-science:
+    profiles: ["stem-science-dedicated"]
+    image: vllm/vllm-openai:latest
+    command:
+      - --model=Qwen/Qwen2.5-1.5B-Instruct
+      - --host=0.0.0.0
+      - --port=8005
+      - --gpu-memory-utilization=0.20
+      - --max-model-len=2048
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+    volumes:
+      - ./data/hf-cache:/root/.cache/huggingface
+    ports:
+      - "8005:8005"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    shm_size: "4gb"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8005/health"]
+      interval: 20s
+      timeout: 5s
+      start_period: 60s
+      retries: 5
+    restart: unless-stopped
+
+  vllm-stem-coding:
+    profiles: ["stem", "stem-coding"]
+    image: vllm/vllm-openai:latest
+    command:
+      - --model=Qwen/Qwen2.5-Coder-1.5B-Instruct
+      - --host=0.0.0.0
+      - --port=8006
+      - --gpu-memory-utilization=0.18
+      # 4096, not 2048: this is the coding agent's first rung, and its repair
+      # prompt carries the task + current files + the failing test output. At
+      # 2048 that prompt overflows, vLLM 400s, and run_vllm_inference silently
+      # escalates — so the repair loop would never actually run on the coder.
+      # 4096 is sufficient (and 8192 is not worth its KV cost): coding_agent caps
+      # the repair prompt at ~3000 chars of files + 2000 of test output, so the
+      # worst case is ~1900 input + 2048 output tokens.
+      - --max-model-len=4096
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+    volumes:
+      - ./data/hf-cache:/root/.cache/huggingface
+    ports:
+      - "8006:8006"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    shm_size: "4gb"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8006/health"]
+      interval: 20s
+      timeout: 5s
+      start_period: 60s
+      retries: 5
+    restart: unless-stopped
+
+  # Escalation rung for the agentic coding harness (coding_agent.py).
+  #
+  # NOT the MoE. vllm-moe serves Qwen3-30B-A3B — ~60 GB of fp16 weights, which
+  # cannot load on a 24 GB vGPU slice at any --gpu-memory-utilization. On this
+  # hardware the honest strongest-code-model escalation is a 4-bit AWQ 7B from
+  # the same Qwen-Coder family: strictly better at code than the 1.5B rung
+  # below it, and it actually fits (~5.5 GB of weights).
+  #
+  # Only started for agent work (profile "agent"); the chat path never uses it.
+  vllm-coder-7b:
+    profiles: ["agent"]
+    image: vllm/vllm-openai:latest
+    command:
+      - --model=Qwen/Qwen2.5-Coder-7B-Instruct-AWQ
+      - --host=0.0.0.0
+      - --port=8009
+      - --quantization=awq
+      # Budget on a 24 GB slice with medium(0.12) + full(0.20, KV-capped) +
+      # coder-1.5b(0.18) already resident, which leaves ~8.1 GiB.
+      # 0.32 of 23.79 GiB = 7.6 GiB: the AWQ weights are 4.85 GiB, so anything
+      # below ~0.28 leaves no room for cache blocks and vLLM refuses to start.
+      # Raising it much past 0.32 will OOM against the resident chat stack.
+      - --gpu-memory-utilization=0.32
+      - --max-model-len=4096
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+    volumes:
+      - ./data/hf-cache:/root/.cache/huggingface
+    ports:
+      - "8009:8009"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    shm_size: "4gb"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8009/health"]
+      interval: 20s
+      timeout: 5s
+      # First boot downloads ~5.5 GB of weights.
+      start_period: 600s
+      retries: 5
+    restart: unless-stopped
+
+  # Llama2-7B always-available fallback (paper §4.3).
+  # Uses the upstream vLLM CPU image. Heavy: prefer to deploy on a node with
+  # ≥32 GB RAM and at least 8 CPU cores, or replace with a quantised
+  # llama.cpp server bound to the same VLLM_FALLBACK_URL.
+  vllm-fallback:
+    profiles: ["fallback"]
+    image: vllm/vllm-openai:latest
+    command:
+      - --model=meta-llama/Llama-2-7b-chat-hf
+      - --host=0.0.0.0
+      - --port=8007
+      - --device=cpu
+      - --max-model-len=2048
+      - --dtype=bfloat16
+    environment:
+      - HF_TOKEN=${HF_TOKEN:-}
+      - VLLM_CPU_KVCACHE_SPACE=${VLLM_CPU_KVCACHE_SPACE:-8}
+    volumes:
+      - ./data/hf-cache:/root/.cache/huggingface
+    ports:
+      - "8007:8007"
+    cpus: "8.0"
+    mem_limit: "32g"
+    shm_size: "4gb"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8007/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 240s
+      retries: 6
+    restart: unless-stopped
+
+  metrics:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "host_metrics_service.py"]
+    environment:
+      CACHE_DURATION: 15
+      SYSTEM_SCRIPT: /app/system_metrics.sh
+      # Set to 1 ONLY if no GPU is present (avoids nvidia-smi errors)
+      DISABLE_GPU_METRICS: ${DISABLE_GPU_METRICS:-0}
+      # Tune GPU_TDP to match your GPU model (W): A100=400, V100=300, T4=70, RTX3090=350
+      GPU_TDP: ${GPU_TDP:-350}
+      CPU_TDP: ${CPU_TDP:-125}
+    ports:
+      - "9000:9000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json, urllib.request; data = json.load(urllib.request.urlopen('http://127.0.0.1:9000/health', timeout=3)); raise SystemExit(0 if data.get('status') == 'ok' else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    restart: unless-stopped
+
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      SYSTEM_SERVICE_URL: http://metrics:9000/metrics
+      VLLM_MEDIUM_URL: http://vllm-medium:8001/v1
+      VLLM_FULL_URL: http://vllm-full:8002/v1
+      # Dedicated endpoints (resolved when the matching compose profile is up).
+      # When the corresponding container is not running, the API falls back to
+      # vllm-full per resolve_vllm_endpoint() in decision_engine.py.
+      VLLM_MOE_URL: ${VLLM_MOE_URL:-http://vllm-moe:8003/v1}
+      VLLM_STEM_MATH_URL: ${VLLM_STEM_MATH_URL:-http://vllm-stem-math:8004/v1}
+      VLLM_STEM_SCIENCE_URL: ${VLLM_STEM_SCIENCE_URL:-http://vllm-stem-science:8005/v1}
+      VLLM_STEM_CODING_URL: ${VLLM_STEM_CODING_URL:-http://vllm-stem-coding:8006/v1}
+      VLLM_FALLBACK_URL: ${VLLM_FALLBACK_URL:-http://vllm-fallback:8007/v1}
+      # Escalation rung for the coding agent (profile "agent"). When the
+      # container is down the harness detects it via _is_vllm_live and reports
+      # escalation_unavailable rather than silently falling back to a general model.
+      VLLM_CODER7B_URL: ${VLLM_CODER7B_URL:-http://vllm-coder-7b:8009/v1}
+      # Agentic coding harness. AGENT_DEFER_CI defaults to 600 for EMAP_ZONE=IN-WE:
+      # that grid sits ~480-560 gCO2/kWh, so the 400 used elsewhere would defer
+      # every agent task forever.
+      AGENT_ENABLED: ${AGENT_ENABLED:-true}
+      AGENT_DEFER_CI: ${AGENT_DEFER_CI:-600}
+      AGENT_CARBON_BUDGET_G: ${AGENT_CARBON_BUDGET_G:-30.0}
+      AGENT_ATTEMPTS_PER_TIER: ${AGENT_ATTEMPTS_PER_TIER:-2}
+      AGENT_LADDER: ${AGENT_LADDER:-}
+      # LLM safety classifier (guardrail rail I.9). Backed by the dedicated
+      # Llama Guard 3 container; fails open if unreachable. GUARDRAILS_LLM_MODE
+      # auto-detects the Llama Guard prompt/response format from the model name.
+      GUARDRAILS_LLM_CLASSIFIER_ENABLED: ${GUARDRAILS_LLM_CLASSIFIER_ENABLED:-true}
+      GUARDRAILS_LLM_URL: ${GUARDRAILS_LLM_URL:-http://vllm-guard:8008/v1}
+      GUARDRAILS_LLM_MODEL: ${GUARDRAILS_LLM_MODEL:-meta-llama/Llama-Guard-3-1B}
+      GUARDRAILS_LLM_MODE: ${GUARDRAILS_LLM_MODE:-auto}
+      GUARDRAILS_LLM_TIMEOUT: ${GUARDRAILS_LLM_TIMEOUT:-6}
+      # Defense-in-depth: 2nd classifier (instruct-prompted) on vllm-full,
+      # blocks if EITHER it or Llama Guard flags. Covers the 1B guard's
+      # euphemism blind spots. Adds a call (no extra VRAM), short-circuited.
+      GUARDRAILS_DEFENSE_IN_DEPTH: ${GUARDRAILS_DEFENSE_IN_DEPTH:-true}
+      GUARDRAILS_INSTRUCT_URL: ${GUARDRAILS_INSTRUCT_URL:-http://vllm-full:8002/v1}
+      GUARDRAILS_INSTRUCT_MODEL: ${GUARDRAILS_INSTRUCT_MODEL:-Qwen/Qwen2.5-1.5B-Instruct}
+      POLICY_CONFIG_PATH: /app/config/policies.json
+      MOE_RECONCILER_ENABLED: ${MOE_RECONCILER_ENABLED:-true}
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-host.docker.internal:9090}
+      OTEL_SERVICE_NAME: ${OTEL_SERVICE_NAME:-adaptive-green-ai}
+      OTEL_EXPORTER_OTLP_INSECURE: ${OTEL_EXPORTER_OTLP_INSECURE:-true}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      # API no longer requires inference to be healthy — it degrades gracefully
+      # when no models are loaded. Only the metrics sidecar is required.
+      metrics:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config:ro
+    ports:
+      - "8100:8100"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json, urllib.request; data = json.load(urllib.request.urlopen('http://127.0.0.1:8100/health/ready', timeout=3)); raise SystemExit(0 if data.get('status') == 'ok' else 1)"]
+      interval: 30s
+      timeout: 8s
+      start_period: 90s
+      retries: 8
+    restart: unless-stopped
+
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    depends_on:
+      - api
+    ports:
+      - "8080:80"
+    restart: unless-stopped

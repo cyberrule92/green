@@ -1,0 +1,33 @@
+# ---------------------------------------------------------------------------
+# SECRETS — never commit. A key pushed to GitHub is compromised the moment it
+# lands: forks, caches and the events API keep it after the commit is deleted.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+deploy/env.production
+
+# The deployment guide renders the live credentials into Appendix A by design.
+# It is regenerated from .env with: python3 docs/generate_deploy_pdf.py
+docs/Adaptive_Green_AI_Deployment.pdf
+
+# ---------------------------------------------------------------------------
+# Runtime state. Contains user prompts, responses and the signed audit trail —
+# private data, not source. hf-cache alone is 19 GB.
+# ---------------------------------------------------------------------------
+data/
+benchmark/results/
+benchmark/*.log
+
+# ---------------------------------------------------------------------------
+# Build output and environments
+# ---------------------------------------------------------------------------
+green-env/
+__pycache__/
+*.py[cod]
+node_modules/
+frontend/dist/
+docs/pdf_assets/
+
+# Local agent/editor state
+.claude/
