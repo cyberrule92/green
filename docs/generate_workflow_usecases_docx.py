@@ -306,7 +306,7 @@ API_ENDPOINTS = [
     ("GET", "/api/workflows/{id}/runs", "Recent runs for a workflow (summaries)."),
     ("GET", "/api/workflows/runs/{run_id}", "One run: status, per-node states, awaiting approvals, total gCO2."),
     ("POST", "/api/workflows/runs/{run_id}/approve", "Approve/reject a paused human-approval node and resume the run."),
-    ("GET", "/api/workflows/templates", "Gallery of the 25 seeded, runnable workflow templates (summaries)."),
+    ("GET", "/api/workflows/templates", "Gallery of the 75 seeded, runnable workflow templates (summaries)."),
     ("POST", "/api/workflows/templates/{id}/instantiate", "Copy a template into a new editable workflow for the tenant."),
 ]
 
@@ -340,9 +340,16 @@ EXAMPLE_JSON = """{
 # ─────────────────────────────────────────────────────────────────────────────
 _CATEGORY_GROUP = {"trigger": "Triggers", "ai": "AI", "logic": "Logic", "io": "Input / Output"}
 _TRIGGER_TYPES = {"manual", "webhook", "schedule", "carbon_window"}
-# carbon/analog prose keyed by template id (paired with the seeded templates, in order).
-_DETAILS = {t["id"]: {"carbon": uc[5], "analog": uc[6], "scenario": uc[2]}
-            for t, uc in zip(_WT.TEMPLATES, USE_CASES)}
+# carbon/analog/scenario prose keyed by template id. New templates carry their own
+# prose; the original 25 fall back to the USE_CASES list (paired positionally).
+_DETAILS: dict[str, dict[str, str]] = {}
+for _i, _t in enumerate(_WT.TEMPLATES):
+    if _t.get("scenario") or _t.get("carbon") or _t.get("analog"):
+        _DETAILS[_t["id"]] = {"scenario": _t.get("scenario") or _t["description"],
+                              "carbon": _t.get("carbon", ""), "analog": _t.get("analog", "")}
+    elif _i < len(USE_CASES):
+        _uc = USE_CASES[_i]
+        _DETAILS[_t["id"]] = {"scenario": _uc[2], "carbon": _uc[5], "analog": _uc[6]}
 
 
 def _palette_label(ntype: str) -> str:
@@ -652,7 +659,7 @@ def build() -> None:
     r.font.color.rgb = DARK
     tag = doc.add_paragraph()
     tag.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    r = tag.add_run("Capabilities & 25 Industry Use Cases")
+    r = tag.add_run("Capabilities & 75 Industry Use Cases")
     r.font.size = Pt(13)
     r.italic = True
     r.font.color.rgb = GREY
@@ -668,7 +675,7 @@ def build() -> None:
           "platform — a visual, node-based automation builder in the style of n8n, Make, and Activepieces, with "
           "the orchestration depth of LangGraph/LangChain and one property neither offers: every AI step is routed "
           "to the greenest model that can still do the job, and whole workflows can be deferred to low-carbon grid "
-          "windows. It then walks through 25 production use cases across seven industries.",
+          "windows. It then walks through 75 production use cases across nine industries.",
           size=11)
 
     # ── 1. What it is ──
@@ -805,19 +812,24 @@ def build() -> None:
           "workflow to Enabled.", italic=True, size=10)
 
     # ── 6. Use cases with full walkthroughs ──
-    doc.add_heading("6. Twenty-five use cases — with step-by-step build instructions", level=1)
+    doc.add_heading("6. Seventy-five use cases — with step-by-step build instructions", level=1)
     _body(doc,
           "Each use case below can be built two ways: Option A instantiates the ready-made template in one click; "
           "Option B walks you through building it by hand, node by node, with the exact value for every field. "
           "Both produce the same workflow. Everything here is generated from the shipped templates, so it matches "
           "the product exactly.")
 
-    current_industry = None
-    for idx, tpl in enumerate(_WT.TEMPLATES, 1):
-        if tpl["industry"] != current_industry:
-            doc.add_heading(tpl["industry"], level=2)
-            current_industry = tpl["industry"]
-        _render_walkthrough(doc, idx, tpl)
+    # Group by industry so each industry heading appears once (templates were
+    # appended over time, not sorted).
+    groups: dict[str, list] = {}
+    for tpl in _WT.TEMPLATES:
+        groups.setdefault(tpl["industry"], []).append(tpl)
+    idx = 1
+    for industry, items in groups.items():
+        doc.add_heading(industry, level=2)
+        for tpl in items:
+            _render_walkthrough(doc, idx, tpl)
+            idx += 1
 
     # ── 7. API ──
     doc.add_heading("7. REST API", level=1)
