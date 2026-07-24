@@ -21,7 +21,7 @@ COPY advanced_rag.py budgets.py coding_agent.py conversation_store.py \
      model_zoo.py model_zoo_updater.py monitoring_layer.py multimodal.py \
      nemo_guardrails.py quality_latency_estimator.py \
      rl_controller.py routing_policies.py semantic_cache.py system_metrics.sh \
-     tenancy.py tracing.py ./
+     tenancy.py tracing.py workflows.py workflow_templates.py ./
 COPY config ./config
 
 RUN sed -i 's/\r$//' /app/system_metrics.sh && \

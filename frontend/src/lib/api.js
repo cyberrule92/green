@@ -396,3 +396,77 @@ export function fetchAgentTask(taskId) {
 export function fetchAgentTasks({ limit = 20 } = {}) {
   return request(`/api/agent/tasks?limit=${limit}`);
 }
+
+// ── Workflow automation (n8n / Make style, carbon-aware) ─────────────────────
+export function fetchWorkflowNodeTypes() {
+  return request("/api/workflows/node-types");
+}
+
+export function fetchWorkflows() {
+  return request("/api/workflows");
+}
+
+export function fetchWorkflow(id) {
+  return request(`/api/workflows/${id}`);
+}
+
+export function createWorkflow({ name, description = "", enabled = true, graph }) {
+  return request("/api/workflows", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, description, enabled, graph }),
+  });
+}
+
+export function updateWorkflow(id, { name, description = "", enabled = true, graph }) {
+  return request(`/api/workflows/${id}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, description, enabled, graph }),
+  });
+}
+
+export function deleteWorkflow(id) {
+  return request(`/api/workflows/${id}`, { method: "DELETE" });
+}
+
+export function runWorkflow(id, input = {}) {
+  return request(`/api/workflows/${id}/run`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ input }),
+  });
+}
+
+export function fetchWorkflowRun(runId) {
+  return request(`/api/workflows/runs/${runId}`);
+}
+
+export function fetchWorkflowRuns(id, { limit = 30 } = {}) {
+  return request(`/api/workflows/${id}/runs?limit=${limit}`);
+}
+
+export function approveWorkflowRun(runId, { nodeId, approved = true, note = "", by = "" } = {}) {
+  return request(`/api/workflows/runs/${runId}/approve`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ node_id: nodeId, approved, note, by }),
+  });
+}
+
+// ── Workflow template gallery (seeded from the 25 use cases) ─────────────────
+export function fetchWorkflowTemplates() {
+  return request("/api/workflows/templates");
+}
+
+export function fetchWorkflowTemplate(templateId) {
+  return request(`/api/workflows/templates/${templateId}`);
+}
+
+export function instantiateWorkflowTemplate(templateId, { name } = {}) {
+  return request(`/api/workflows/templates/${templateId}/instantiate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(name ? { name } : {}),
+  });
+}
