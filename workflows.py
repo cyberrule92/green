@@ -48,10 +48,61 @@ MAX_DEPTH = int(os.getenv("WF_MAX_DEPTH", "5"))            # sub-workflow nestin
 MAX_FOREACH = int(os.getenv("WF_MAX_FOREACH", "100"))      # items a foreach may fan out
 HTTP_TIMEOUT_S = float(os.getenv("WF_HTTP_TIMEOUT_S", "20"))
 HTTP_MAX_BYTES = int(os.getenv("WF_HTTP_MAX_BYTES", str(512 * 1024)))
+MAX_WAIT_S = float(os.getenv("WF_MAX_WAIT_S", "300"))     # a `wait` node's in-run sleep ceiling
 
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Secret box: authenticated symmetric encryption for credential values at rest.
+# Stdlib-only (the project has no `cryptography` dep): an HMAC-SHA256 keystream
+# in counter mode (encrypt) with encrypt-then-MAC (authenticate). Keyed off a
+# caller-supplied key — decision_engine passes WF_SECRET_KEY, falling back to the
+# audit HMAC key. Ciphertext is urlsafe-base64 of nonce||ct||tag.
+# ─────────────────────────────────────────────────────────────────────────────
+import base64
+import hashlib
+import hmac as _hmac
+import secrets as _secrets
+
+_SECRET_NONCE_LEN = 16
+_SECRET_TAG_LEN = 32
+
+
+def _keystream(key: bytes, nonce: bytes, length: int) -> bytes:
+    out = bytearray()
+    counter = 0
+    while len(out) < length:
+        out.extend(_hmac.new(key, nonce + counter.to_bytes(8, "big"), hashlib.sha256).digest())
+        counter += 1
+    return bytes(out[:length])
+
+
+def secret_encrypt(plaintext: str, key: bytes) -> str:
+    """Encrypt+authenticate a UTF-8 string; returns a urlsafe-base64 token."""
+    data = plaintext.encode("utf-8")
+    nonce = _secrets.token_bytes(_SECRET_NONCE_LEN)
+    ct = bytes(a ^ b for a, b in zip(data, _keystream(key, nonce, len(data))))
+    tag = _hmac.new(key, b"wf-secret-v1" + nonce + ct, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(nonce + ct + tag).decode("ascii")
+
+
+def secret_decrypt(token: str, key: bytes) -> str:
+    """Inverse of :func:`secret_encrypt`. Raises ``ValueError`` on tamper/format."""
+    try:
+        raw = base64.urlsafe_b64decode(token.encode("ascii"))
+    except Exception as exc:  # noqa: BLE001 - malformed token
+        raise ValueError("malformed secret token") from exc
+    if len(raw) < _SECRET_NONCE_LEN + _SECRET_TAG_LEN:
+        raise ValueError("secret token too short")
+    nonce, tag = raw[:_SECRET_NONCE_LEN], raw[-_SECRET_TAG_LEN:]
+    ct = raw[_SECRET_NONCE_LEN:-_SECRET_TAG_LEN]
+    expected = _hmac.new(key, b"wf-secret-v1" + nonce + ct, hashlib.sha256).digest()
+    if not _hmac.compare_digest(tag, expected):
+        raise ValueError("secret token failed authentication")
+    return bytes(a ^ b for a, b in zip(ct, _keystream(key, nonce, len(ct)))).decode("utf-8")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -97,7 +148,7 @@ class WorkflowStore:
                     id TEXT PRIMARY KEY,
                     workflow_id TEXT NOT NULL,
                     tenant_id TEXT NOT NULL DEFAULT 'default',
-                    status TEXT NOT NULL,          -- running | completed | failed
+                    status TEXT NOT NULL,          -- running | completed | failed | cancelled | awaiting_approval
                     trigger TEXT NOT NULL DEFAULT 'manual',
                     started_at TEXT NOT NULL,
                     finished_at TEXT,
@@ -107,6 +158,16 @@ class WorkflowStore:
                     FOREIGN KEY(workflow_id) REFERENCES workflows(id) ON DELETE CASCADE
                 );
 
+                CREATE TABLE IF NOT EXISTS workflow_credentials (
+                    id TEXT PRIMARY KEY,
+                    tenant_id TEXT NOT NULL DEFAULT 'default',
+                    name TEXT NOT NULL,
+                    type TEXT NOT NULL DEFAULT 'bearer',   -- bearer | basic | header
+                    secret_json TEXT NOT NULL,             -- encrypted (secret_encrypt)
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_wfcred_tenant ON workflow_credentials(tenant_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_wf_tenant ON workflows(tenant_id, updated_at);
                 CREATE INDEX IF NOT EXISTS idx_wfrun_wf ON workflow_runs(workflow_id, started_at);
                 CREATE INDEX IF NOT EXISTS idx_wfrun_tenant ON workflow_runs(tenant_id, started_at);
@@ -201,6 +262,61 @@ class WorkflowStore:
         with self._lock, self._connect() as connection:
             cur = connection.execute(
                 "DELETE FROM workflows WHERE id = ? AND tenant_id = ?", (wf_id, tenant_id)
+            )
+            return cur.rowcount > 0
+
+    # ── credentials ──────────────────────────────────────────────────────────
+    # The store keeps ``secret_token`` as an opaque, already-encrypted blob — it
+    # never sees the key. decision_engine encrypts before create and decrypts
+    # after fetch (via the ``decrypt_credential`` service). Public list never
+    # exposes the token.
+    def create_credential(
+        self, name: str, cred_type: str, secret_token: str, tenant_id: str = "default"
+    ) -> dict[str, Any]:
+        cred_id = uuid4().hex[:12]
+        now = utc_now_iso()
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """INSERT INTO workflow_credentials (id, tenant_id, name, type, secret_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (cred_id, tenant_id, name, cred_type, secret_token, now),
+            )
+        return {"id": cred_id, "name": name, "type": cred_type, "created_at": now}
+
+    def list_credentials(self, tenant_id: str = "default") -> list[dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id, name, type, created_at FROM workflow_credentials "
+                "WHERE tenant_id = ? ORDER BY created_at DESC",
+                (tenant_id,),
+            ).fetchall()
+        return [{"id": r["id"], "name": r["name"], "type": r["type"],
+                 "created_at": r["created_at"]} for r in rows]
+
+    def get_credential_token(self, cred_id: str, tenant_id: str) -> dict[str, Any] | None:
+        """Internal: the encrypted token + type, for decryption. Never surfaced
+        by an API.
+
+        ``tenant_id`` is mandatory and always constrains the lookup — there is no
+        cross-tenant read. A credential is a bearer secret and the HTTP node that
+        consumes it sends it to a caller-supplied URL, so an unscoped lookup is an
+        exfiltration path, not a convenience.
+        """
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM workflow_credentials WHERE id = ? AND tenant_id = ?",
+                (cred_id, tenant_id),
+            ).fetchone()
+        if not row:
+            return None
+        return {"id": row["id"], "name": row["name"], "type": row["type"],
+                "secret_token": row["secret_json"], "tenant_id": row["tenant_id"]}
+
+    def delete_credential(self, cred_id: str, tenant_id: str = "default") -> bool:
+        with self._lock, self._connect() as connection:
+            cur = connection.execute(
+                "DELETE FROM workflow_credentials WHERE id = ? AND tenant_id = ?",
+                (cred_id, tenant_id),
             )
             return cur.rowcount > 0
 
@@ -344,6 +460,12 @@ class WorkflowServices:
     grid_ci: Optional[Callable[[], float]] = None
     # Resolve a saved workflow by id → its record (for the sub-workflow node).
     load_workflow: Optional[Callable[[str], Optional[dict[str, Any]]]] = None
+    # Resolve (credential_id, tenant_id) → decrypted {type, secret:{...}} for HTTP
+    # auth. The engine never holds the encryption key; decryption happens in this
+    # callable. The tenant is REQUIRED and must be enforced by the implementation:
+    # the HTTP node's URL is caller-controlled, so an unscoped lookup would let one
+    # tenant post another tenant's secret to a server of its choosing.
+    decrypt_credential: Optional[Callable[[str, str], Optional[dict[str, Any]]]] = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -553,7 +675,11 @@ async def _h_agent(ex: NodeExec) -> dict[str, Any]:
         carbon_budget_g = float(budget) if budget not in (None, "") else None
     except (TypeError, ValueError):
         carbon_budget_g = None
-    result = ex.services.agent_run(
+    # Offload the synchronous, potentially long-running agent to a thread so it
+    # does not block the event loop or the other nodes in this superstep
+    # (matches _h_http). A coding task can run for minutes.
+    result = await asyncio.to_thread(
+        ex.services.agent_run,
         task=task,
         tests=tests if tests else None,
         carbon_budget_g=carbon_budget_g,
@@ -581,6 +707,24 @@ async def _h_image(ex: NodeExec) -> dict[str, Any]:
     }
 
 
+def _inject_credential(headers: dict[str, Any], cred: dict[str, Any]) -> None:
+    """Mutate ``headers`` in place to carry the credential's auth. ``cred`` is the
+    decrypted ``{type, secret:{...}}`` record from the store."""
+    ctype = str(cred.get("type", "bearer")).lower()
+    secret = cred.get("secret") or {}
+    if ctype == "bearer":
+        token = str(secret.get("token", ""))
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+    elif ctype == "basic":
+        raw = f"{secret.get('username', '')}:{secret.get('password', '')}".encode("utf-8")
+        headers["Authorization"] = "Basic " + base64.b64encode(raw).decode("ascii")
+    elif ctype == "header":
+        name = str(secret.get("name", "")).strip()
+        if name:
+            headers[name] = str(secret.get("value", ""))
+
+
 async def _h_http(ex: NodeExec) -> dict[str, Any]:
     method = (_stringify(ex.param("method", "GET")) or "GET").upper()
     url = _stringify(ex.param("url", "")).strip()
@@ -597,6 +741,19 @@ async def _h_http(ex: NodeExec) -> dict[str, Any]:
     if body not in (None, ""):
         data = (body if isinstance(body, str) else json.dumps(body)).encode("utf-8")
         headers.setdefault("Content-Type", "application/json")
+
+    # Optional credential: resolved at dispatch, scoped to the running workflow's
+    # tenant, and injected into the request headers only. The secret never enters
+    # the templating scope and is never part of the returned dict, so it cannot
+    # reach node_states or a downstream template.
+    cred_id = _stringify(ex.param("credential_id", "")).strip()
+    if cred_id:
+        if ex.services.decrypt_credential is None:
+            raise RuntimeError("http node: credential store not wired")
+        cred = ex.services.decrypt_credential(cred_id, ex.tenant_id)
+        if not cred:
+            raise ValueError(f"http node: unknown credential {cred_id}")
+        _inject_credential(headers, cred)
 
     def _do_request() -> dict[str, Any]:
         req = urllib.request.Request(url, data=data, method=method,
@@ -688,6 +845,123 @@ async def _h_carbon_gate(ex: NodeExec) -> dict[str, Any]:
     }
 
 
+async def _h_switch(ex: NodeExec) -> dict[str, Any]:
+    """Multi-way branch (generalises IF). Evaluates ``cases`` top-to-bottom; the
+    first match activates its handle, else the ``default`` handle. Each case is
+    ``{handle, field, op, value}`` — ``field``/``value`` are templated."""
+    cases = ex.param("cases", []) or []
+    default_handle = _stringify(ex.param("default_handle", "default")) or "default"
+    matched = default_handle
+    if isinstance(cases, list):
+        for case in cases:
+            if not isinstance(case, dict):
+                continue
+            fn = _OPS.get(_stringify(case.get("op", "==")) or "==", _OPS["=="])
+            if fn(case.get("field", ""), case.get("value", "")):
+                matched = _stringify(case.get("handle")) or default_handle
+                break
+    return {"matched": matched, "_active_handles": {matched}}
+
+
+async def _h_filter(ex: NodeExec) -> dict[str, Any]:
+    """Single logical gate: forward the input unchanged when the condition holds,
+    otherwise prune every downstream edge (a simpler cousin of ``carbon_gate``)."""
+    fn = _OPS.get(_stringify(ex.param("op", "==")) or "==", _OPS["=="])
+    passed = bool(fn(ex.param("field", ""), ex.param("value", "")))
+    if passed:
+        # No _active_handles → every out-edge stays live and the input forwards.
+        return {**ex.inputs, "passed": True}
+    return {"passed": False, "_active_handles": set()}
+
+
+async def _h_wait(ex: NodeExec) -> dict[str, Any]:
+    """Pause the run for a bounded number of seconds.
+
+    MVP is an in-run sleep, which holds a slot in the superstep. Long or
+    until-timestamp waits should instead reuse the approval-style pause/resume
+    plus the scheduler, so the run is not resident while it waits — kept out of
+    this pass deliberately.
+    """
+    duration = max(0.0, min(_float(ex.param("duration_s", 0), 0.0), MAX_WAIT_S))
+    if duration > 0:
+        await asyncio.sleep(duration)
+    return {**ex.inputs, "waited_s": duration}
+
+
+async def _h_set_variables(ex: NodeExec) -> dict[str, Any]:
+    """Write templated values into the run-level ``$vars`` store (shared by
+    reference), so downstream nodes can read them without an edge."""
+    fields = (ex.node.get("params") or {}).get("fields", {})
+    if not isinstance(fields, dict):
+        return {"vars": {}}
+    resolved = {k: resolve_templates(v, ex.scope) for k, v in fields.items()}
+    run_vars = ex.scope.get("vars")
+    if isinstance(run_vars, dict):
+        run_vars.update(resolved)
+    return {"vars": resolved}
+
+
+async def _h_notify(ex: NodeExec) -> dict[str, Any]:
+    """Send a notification. ``channel`` = webhook (POST the message JSON to a
+    URL) or email (stdlib smtplib, gated on SMTP_* env — a graceful logged no-op
+    when unconfigured, matching the multimodal fallback convention)."""
+    channel = (_stringify(ex.param("channel", "webhook")) or "webhook").lower()
+    target = _stringify(ex.param("target", "")).strip()
+    message = _stringify(ex.param("message", ""))
+
+    if channel == "webhook":
+        if not target.lower().startswith(("http://", "https://")):
+            raise ValueError("notify node: webhook target must be http(s)")
+
+        def _post() -> int:
+            req = urllib.request.Request(
+                target, data=json.dumps({"message": message}).encode("utf-8"),
+                method="POST", headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as resp:
+                    return resp.status
+            except urllib.error.HTTPError as err:
+                return err.code
+
+        status = await asyncio.to_thread(_post)
+        return {"sent": 200 <= status < 300, "channel": "webhook",
+                "target": target, "http_status": status}
+
+    if channel == "email":
+        host = os.getenv("SMTP_HOST", "").strip()
+        if not host:
+            logger.info("notify node: SMTP not configured — skipping email to %s", target)
+            return {"sent": False, "channel": "email", "target": target,
+                    "reason": "smtp_unconfigured"}
+
+        def _send() -> bool:
+            import smtplib
+            from email.message import EmailMessage
+            msg = EmailMessage()
+            msg["Subject"] = os.getenv("SMTP_SUBJECT", "Workflow notification")
+            msg["From"] = os.getenv("SMTP_FROM", "workflows@green-ai.local")
+            msg["To"] = target
+            msg.set_content(message)
+            with smtplib.SMTP(host, int(os.getenv("SMTP_PORT", "587")),
+                              timeout=HTTP_TIMEOUT_S) as server:
+                if os.getenv("SMTP_STARTTLS", "true").lower() in ("1", "true", "yes"):
+                    server.starttls()
+                user, pwd = os.getenv("SMTP_USER", ""), os.getenv("SMTP_PASSWORD", "")
+                if user and pwd:
+                    server.login(user, pwd)
+                server.send_message(msg)
+            return True
+
+        try:
+            ok = await asyncio.to_thread(_send)
+        except Exception as exc:  # noqa: BLE001 - notification is best-effort
+            logger.warning("notify node: email send failed: %s", exc)
+            return {"sent": False, "channel": "email", "target": target, "reason": str(exc)}
+        return {"sent": ok, "channel": "email", "target": target}
+
+    raise ValueError(f"notify node: unknown channel {channel!r}")
+
+
 async def _h_subworkflow(ex: NodeExec) -> dict[str, Any]:
     """Run another saved workflow as a node — the composition primitive that
     makes this an orchestrator (LangGraph subgraph parity). With ``items`` set to
@@ -775,12 +1049,14 @@ register(NodeType("image_gen", "Image generation", "ai",
                   _h_image))
 
 register(NodeType("http_request", "HTTP request", "io",
-                  "Call an external HTTP(S) API. Body/headers support templates.",
+                  "Call an external HTTP(S) API. Body/headers support templates. "
+                  "Set credential_id to attach stored auth (never echoed in output).",
                   [{"name": "method", "label": "Method", "type": "select",
                     "options": ["GET", "POST", "PUT", "PATCH", "DELETE"], "default": "GET"},
                    {"name": "url", "label": "URL", "type": "text", "default": ""},
                    {"name": "headers", "label": "Headers (JSON)", "type": "textarea", "default": "{}"},
-                   {"name": "body", "label": "Body", "type": "textarea", "default": ""}],
+                   {"name": "body", "label": "Body", "type": "textarea", "default": ""},
+                   {"name": "credential_id", "label": "Credential ID (optional)", "type": "text", "default": ""}],
                   _h_http))
 register(NodeType("transform", "Set / transform", "logic",
                   "Build an output object from templated fields.",
@@ -798,6 +1074,36 @@ register(NodeType("carbon_gate", "Carbon gate", "logic",
                   "Branch on live grid carbon. Handles: green / dirty.",
                   [{"name": "threshold_g", "label": "Max gCO2/kWh", "type": "number", "default": 300}],
                   _h_carbon_gate, handles_out=["green", "dirty"]))
+register(NodeType("switch", "Switch (multi-way)", "logic",
+                  "Route to the first matching case, else default. Handles are the case handles + default.",
+                  [{"name": "cases", "label": "Cases [{handle, field, op, value}]", "type": "keyvalue", "default": []},
+                   {"name": "default_handle", "label": "Default handle", "type": "text", "default": "default"}],
+                  _h_switch, handles_out=["default"]))
+register(NodeType("filter", "Filter", "logic",
+                  "Forward the input when the condition holds; otherwise prune all downstream.",
+                  [{"name": "field", "label": "Value", "type": "text", "default": ""},
+                   {"name": "op", "label": "Operator", "type": "select",
+                    "options": ["==", "!=", "contains", ">", "<", "empty", "not_empty"], "default": "=="},
+                   {"name": "value", "label": "Compare to", "type": "text", "default": ""}],
+                  _h_filter))
+register(NodeType("wait", "Wait / delay", "logic",
+                  f"Pause the run for up to {int(MAX_WAIT_S)}s, then forward the input.",
+                  [{"name": "duration_s", "label": "Duration (s)", "type": "number", "default": 1}],
+                  _h_wait))
+register(NodeType("set_variables", "Set variables", "logic",
+                  "Write templated values into the run-level $vars store for downstream nodes.",
+                  [{"name": "fields", "label": "Vars (key → template)", "type": "keyvalue", "default": {}}],
+                  _h_set_variables))
+register(NodeType("notify", "Notify", "io",
+                  "Send a webhook POST or an email (SMTP_* env; graceful no-op if unconfigured).",
+                  [{"name": "channel", "label": "Channel", "type": "select",
+                    "options": ["webhook", "email"], "default": "webhook"},
+                   {"name": "target", "label": "Target (URL or email)", "type": "text", "default": ""},
+                   {"name": "message", "label": "Message", "type": "textarea", "default": ""}],
+                  _h_notify))
+register(NodeType("error_trigger", "Error trigger", "trigger",
+                  "Runs this workflow as an error handler; output is {workflow_id, run_id, error, failed_node}.",
+                  [], _h_passthrough, is_trigger=True))
 register(NodeType("merge", "Merge", "logic",
                   "Join branches; forwards merged upstream output.",
                   [], _h_passthrough))
@@ -892,6 +1198,7 @@ class WorkflowEngine:
         _depth: int = 0,
         resume_state: Optional[dict[str, Any]] = None,
         approvals: Optional[dict[str, dict[str, Any]]] = None,
+        cancel_event: Optional[asyncio.Event] = None,
     ) -> dict[str, Any]:
         """Run (or resume) a validated graph. Returns
         ``{status, total_carbon_g, node_states, error}`` and, when it stops at an
@@ -931,7 +1238,8 @@ class WorkflowEngine:
             n = nodes[nid]
             return {"id": nid, "type": n.get("type"), "label": n.get("label") or n.get("type"),
                     "status": "pending", "output": None, "carbon_g": 0.0,
-                    "error": None, "attempts": 0}
+                    "error": None, "attempts": 0, "duration_ms": None,
+                    "started_at": None, "finished_at": None}
 
         if resume_state:
             node_outputs: dict[str, Any] = dict(resume_state.get("node_outputs", {}))
@@ -947,6 +1255,7 @@ class WorkflowEngine:
             steps = int(resume_state.get("steps", 0))
             total_carbon = float(resume_state.get("total_carbon", 0.0))
             run_error: str | None = resume_state.get("run_error")
+            run_vars: dict[str, Any] = dict(resume_state.get("run_vars", {}))
             trigger_input = resume_state.get("trigger_input", trigger_input)
             # Apply decisions: an awaiting approval node becomes runnable again.
             for nid, dec in approvals.items():
@@ -964,6 +1273,7 @@ class WorkflowEngine:
             steps = 0
             total_carbon = 0.0
             run_error = None
+            run_vars = {}
 
         def _emit() -> None:
             if on_progress:
@@ -989,8 +1299,12 @@ class WorkflowEngine:
             node = nodes[nid]
             ntype = NODE_TYPES[node["type"]]
             merged = _merged_input(nid)
+            # run_vars is shared BY REFERENCE so a set_variables node persists
+            # state that {{ $vars.* }} reads downstream, across supersteps. asyncio
+            # is single-threaded so a shared dict is safe here, but ordering
+            # between two set_variables in the SAME superstep is unspecified.
             scope = {"nodes": node_outputs, "input": merged,
-                     "trigger": trigger_input, "vars": {}, "_depth": _depth}
+                     "trigger": trigger_input, "vars": run_vars, "_depth": _depth}
             ex = NodeExec(node=node, inputs=merged, scope=scope,
                           services=self.services, tenant_id=tenant_id)
 
@@ -1001,6 +1315,8 @@ class WorkflowEngine:
             on_error = str(node.get("on_error", "stop")).lower()
 
             states[nid]["status"] = "running"
+            states[nid]["started_at"] = utc_now_iso()
+            _t0 = time.perf_counter()
             _emit()
             attempt, last_exc = 0, None
             async with sem:
@@ -1018,6 +1334,8 @@ class WorkflowEngine:
                         states[nid]["status"] = "completed"
                         states[nid]["output"] = _truncate_output(output)
                         states[nid]["carbon_g"] = carbon
+                        states[nid]["finished_at"] = utc_now_iso()
+                        states[nid]["duration_ms"] = round((time.perf_counter() - _t0) * 1000, 1)
                         return
                     except Exception as exc:  # noqa: BLE001 - retryable node failure
                         last_exc = exc
@@ -1025,6 +1343,8 @@ class WorkflowEngine:
                             await asyncio.sleep(backoff * attempt)
             states[nid]["status"] = "failed"
             states[nid]["error"] = f"{type(last_exc).__name__}: {last_exc}"
+            states[nid]["finished_at"] = utc_now_iso()
+            states[nid]["duration_ms"] = round((time.perf_counter() - _t0) * 1000, 1)
             node_outputs[nid] = {}
             logger.warning("workflow node %s (%s) failed after %d attempt(s): %s",
                            nid, node.get("type"), attempt, last_exc)
@@ -1054,8 +1374,14 @@ class WorkflowEngine:
                         active_node[tgt] = any(edge_active.get(ie) for ie in in_edges[tgt])
                         ready.append(tgt)
 
+        cancelled = False
         awaiting: list[str] = []
         while ready:
+            # Cooperative cancel: checked between supersteps, so nodes already
+            # in flight finish rather than being torn down mid-call.
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+                break
             batch = [nid for nid in ready if states[nid]["status"] == "pending"]
             ready = []
             if not batch:
@@ -1092,6 +1418,9 @@ class WorkflowEngine:
             _emit()
             if run_error and "step budget" in run_error:
                 break
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+                break
 
             for nid in batch:
                 if states[nid]["status"] == "awaiting_approval":
@@ -1112,13 +1441,14 @@ class WorkflowEngine:
                     "steps": steps,
                     "total_carbon": total_carbon,
                     "run_error": run_error,
+                    "run_vars": run_vars,
                     "trigger_input": trigger_input,
                 }
                 pending_approvals = []
                 for nid in awaiting:
                     msg = (nodes[nid].get("params") or {}).get("message", "")
                     msg = resolve_templates(msg, {"nodes": node_outputs, "input": {},
-                                                  "trigger": trigger_input, "vars": {}})
+                                                  "trigger": trigger_input, "vars": run_vars})
                     pending_approvals.append({"id": nid, "label": states[nid]["label"],
                                               "message": _stringify(msg)})
                 _emit()
@@ -1132,10 +1462,14 @@ class WorkflowEngine:
                 }
 
         for nid in nodes:
-            if states[nid]["status"] == "pending":
+            if states[nid]["status"] in ("pending", "running"):
                 states[nid]["status"] = "skipped"
 
-        status = "failed" if run_error else "completed"
+        if cancelled:
+            status = "cancelled"
+            run_error = run_error or "run cancelled"
+        else:
+            status = "failed" if run_error else "completed"
         return {
             "status": status,
             "total_carbon_g": round(total_carbon, 6),
@@ -1358,4 +1692,170 @@ if __name__ == "__main__":
     b7 = {s["id"]: s for s in r7["node_states"]}
     assert b7["drop"]["status"] == "completed" and b7["pub"]["status"] == "skipped", b7
     print("✓ human-in-the-loop approval pause/resume (approve + reject) smoke test passed")
+
+    # ── Flow-logic nodes: switch / filter / set_variables / wait ─────────────
+    engine5 = WorkflowEngine(WorkflowServices(llm=_fake_llm))
+    g5 = {
+        "nodes": [
+            {"id": "t", "type": "manual", "params": {}},
+            {"id": "vars", "type": "set_variables",
+             "params": {"fields": {"tier": "{{ $trigger.tier }}", "n": "2"}}},
+            {"id": "sw", "type": "switch", "params": {
+                "cases": [{"handle": "gold", "field": "{{ $vars.tier }}", "op": "==", "value": "gold"},
+                          {"handle": "silver", "field": "{{ $vars.tier }}", "op": "==", "value": "silver"}],
+                "default_handle": "other"}},
+            {"id": "keep", "type": "filter",
+             "params": {"field": "{{ $vars.n }}", "op": ">", "value": "1"}},
+            {"id": "gold_out", "type": "transform", "params": {"fields": {"picked": "gold-{{ $vars.tier }}"}}},
+            {"id": "silver_out", "type": "transform", "params": {"fields": {"picked": "silver"}}},
+            {"id": "other_out", "type": "transform", "params": {"fields": {"picked": "other"}}},
+        ],
+        "edges": [
+            {"source": "t", "target": "vars"}, {"source": "vars", "target": "sw"},
+            {"source": "sw", "target": "keep", "sourceHandle": "gold"},
+            {"source": "keep", "target": "gold_out"},
+            {"source": "sw", "target": "silver_out", "sourceHandle": "silver"},
+            {"source": "sw", "target": "other_out", "sourceHandle": "other"},
+        ],
+    }
+    r_sw = asyncio.run(engine5.execute(g5, trigger_input={"tier": "gold"}))
+    b_sw = {s["id"]: s for s in r_sw["node_states"]}
+    assert r_sw["status"] == "completed", r_sw
+    assert b_sw["sw"]["output"]["matched"] == "gold", b_sw["sw"]
+    assert b_sw["gold_out"]["status"] == "completed", b_sw["gold_out"]
+    assert b_sw["gold_out"]["output"]["picked"] == "gold-gold", b_sw["gold_out"]  # $vars downstream
+    assert b_sw["silver_out"]["status"] == "skipped", b_sw["silver_out"]
+    assert b_sw["other_out"]["status"] == "skipped", b_sw["other_out"]
+    assert b_sw["keep"]["output"]["passed"] is True, b_sw["keep"]
+    assert b_sw["vars"]["duration_ms"] is not None, "per-node duration not recorded"
+    print("✓ switch + set_variables($vars) + filter-pass + duration smoke test passed")
+
+    g6 = {
+        "nodes": [{"id": "t", "type": "manual", "params": {}},
+                  {"id": "keep", "type": "filter", "params": {"field": "0", "op": ">", "value": "1"}},
+                  {"id": "after", "type": "transform", "params": {"fields": {"ran": "yes"}}}],
+        "edges": [{"source": "t", "target": "keep"}, {"source": "keep", "target": "after"}],
+    }
+    r_f = asyncio.run(engine5.execute(g6, trigger_input={}))
+    b_f = {s["id"]: s for s in r_f["node_states"]}
+    assert b_f["keep"]["output"]["passed"] is False and b_f["after"]["status"] == "skipped", b_f
+    print("✓ filter-prune smoke test passed")
+
+    g7 = {
+        "nodes": [{"id": "t", "type": "manual", "params": {}},
+                  {"id": "w", "type": "wait", "params": {"duration_s": "0.05"}}],
+        "edges": [{"source": "t", "target": "w"}],
+    }
+    _tw = _t.perf_counter()
+    r_w = asyncio.run(engine5.execute(g7, trigger_input={}))
+    assert (_t.perf_counter() - _tw) >= 0.04, "wait node did not sleep"
+    assert {s["id"]: s for s in r_w["node_states"]}["w"]["output"]["waited_s"] == 0.05
+    print("✓ wait smoke test passed")
+
+    # $vars must survive an approval pause, since it rides in the state blob.
+    engine5b = WorkflowEngine(WorkflowServices(llm=_fake_llm))
+    g_pause = {
+        "nodes": [{"id": "t", "type": "manual", "params": {}},
+                  {"id": "v", "type": "set_variables", "params": {"fields": {"keep": "me"}}},
+                  {"id": "ok", "type": "approval", "params": {"message": "vars={{ $vars.keep }}"}},
+                  {"id": "after", "type": "transform", "params": {"fields": {"got": "{{ $vars.keep }}"}}}],
+        "edges": [{"source": "t", "target": "v"}, {"source": "v", "target": "ok"},
+                  {"source": "ok", "target": "after", "sourceHandle": "approved"}],
+    }
+    r_p = asyncio.run(engine5b.execute(g_pause, trigger_input={}))
+    assert r_p["status"] == "paused" and "vars=me" in r_p["awaiting"][0]["message"], r_p["awaiting"]
+    r_p2 = asyncio.run(engine5b.execute(g_pause, resume_state=json.loads(json.dumps(r_p["state"])),
+                                        approvals={"ok": {"approved": True}}))
+    b_p2 = {s["id"]: s for s in r_p2["node_states"]}
+    assert b_p2["after"]["output"]["got"] == "me", b_p2["after"]
+    print("✓ $vars survives approval pause/resume smoke test passed")
+
+    # ── Cooperative cancel mid-run ──────────────────────────────────────────
+    async def _cancel_scenario() -> dict[str, Any]:
+        ev = asyncio.Event()
+
+        async def _slow(prompt: str, **_: Any) -> dict[str, Any]:
+            await asyncio.sleep(0.15)
+            return {"text": "x", "carbon_g": 0.01}
+
+        eng = WorkflowEngine(WorkflowServices(llm=_slow))
+        g = {"nodes": [{"id": "t", "type": "manual", "params": {}},
+                       {"id": "a", "type": "llm", "params": {"prompt": "A"}},
+                       {"id": "b", "type": "llm", "params": {"prompt": "B"}}],
+             "edges": [{"source": "t", "target": "a"}, {"source": "a", "target": "b"}]}
+        task = asyncio.ensure_future(eng.execute(g, trigger_input={}, cancel_event=ev))
+        await asyncio.sleep(0.05)     # let 'a' start
+        ev.set()
+        return await task
+
+    r_c = asyncio.run(_cancel_scenario())
+    b_c = {s["id"]: s for s in r_c["node_states"]}
+    assert r_c["status"] == "cancelled", r_c
+    assert b_c["b"]["status"] == "skipped", b_c["b"]
+    print("✓ cooperative cancel mid-run smoke test passed")
+
+    # ── Secret box round-trip + tamper detection ────────────────────────────
+    _k = b"unit-test-key-32-bytes-xxxxxxxxxx"
+    _tok = secret_encrypt('{"token":"s3cr3t"}', _k)
+    assert secret_decrypt(_tok, _k) == '{"token":"s3cr3t"}'
+    try:
+        secret_decrypt(_tok[:-2] + ("AA" if not _tok.endswith("AA") else "BB"), _k)
+        raise AssertionError("tampered token should not decrypt")
+    except ValueError:
+        pass
+    print("✓ secret box encrypt/decrypt + tamper smoke test passed")
+
+    # ── Credential tenant isolation ─────────────────────────────────────────
+    # A credential is a bearer secret and the HTTP node sends it to a
+    # caller-supplied URL, so a cross-tenant read is an exfiltration path.
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as _td:
+        _store = WorkflowStore(Path(_td) / "creds_test.db")
+        _cred = _store.create_credential(
+            name="prod-api", cred_type="bearer",
+            secret_token=secret_encrypt('{"token":"tenant-a-secret"}', _k),
+            tenant_id="tenant-a")
+        assert _store.get_credential_token(_cred["id"], "tenant-a") is not None
+        assert _store.get_credential_token(_cred["id"], "tenant-b") is None, \
+            "SECURITY: credential readable across tenants"
+        _listed = _store.list_credentials(tenant_id="tenant-a")
+        assert len(_listed) == 1 and "secret_token" not in _listed[0] and "secret_json" not in _listed[0]
+        assert _store.list_credentials(tenant_id="tenant-b") == []
+    print("✓ credential tenant-isolation smoke test passed")
+
+    # The HTTP node must hand the running workflow's tenant to the resolver.
+    _seen: dict[str, Any] = {}
+
+    def _spy_decrypt(cred_id: str, tenant_id: str) -> dict[str, Any] | None:
+        _seen["cred_id"], _seen["tenant_id"] = cred_id, tenant_id
+        return None      # → node raises "unknown credential" before any request
+
+    engine6 = WorkflowEngine(WorkflowServices(decrypt_credential=_spy_decrypt))
+    g8 = {
+        "nodes": [{"id": "t", "type": "manual", "params": {}},
+                  {"id": "call", "type": "http_request",
+                   "params": {"url": "https://example.com/x", "credential_id": "cred123"}}],
+        "edges": [{"source": "t", "target": "call"}],
+    }
+    r_cred = asyncio.run(engine6.execute(g8, trigger_input={}, tenant_id="acme"))
+    assert _seen.get("tenant_id") == "acme", f"tenant not threaded to resolver: {_seen}"
+    assert _seen.get("cred_id") == "cred123", _seen
+    assert {s["id"]: s for s in r_cred["node_states"]}["call"]["status"] == "failed"
+    print("✓ http-node credential tenant-threading smoke test passed")
+
+    # A secret must never reach node output / node_states.
+    def _real_decrypt(cred_id: str, tenant_id: str) -> dict[str, Any]:
+        return {"type": "bearer", "secret": {"token": "SUPERSECRET"}}
+
+    engine7 = WorkflowEngine(WorkflowServices(decrypt_credential=_real_decrypt))
+    g9 = {
+        "nodes": [{"id": "t", "type": "manual", "params": {}},
+                  {"id": "call", "type": "http_request",
+                   "params": {"url": "http://127.0.0.1:9/", "credential_id": "c1"}}],
+        "edges": [{"source": "t", "target": "call"}],
+    }
+    r_leak = asyncio.run(engine7.execute(g9, trigger_input={}, tenant_id="acme"))
+    assert "SUPERSECRET" not in json.dumps(r_leak["node_states"]), "SECURITY: secret leaked into node_states"
+    print("✓ credential secret absent from run state smoke test passed")
+
     print("\n✓ ALL smoke tests passed")
