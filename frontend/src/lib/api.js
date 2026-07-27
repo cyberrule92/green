@@ -454,7 +454,32 @@ export function approveWorkflowRun(runId, { nodeId, approved = true, note = "", 
   });
 }
 
-// ── Workflow template gallery (seeded from the 25 use cases) ─────────────────
+export function fetchWorkflowRunReceipt(runId) {
+  return request(`/api/workflows/runs/${runId}/receipt`);
+}
+
+export function cancelWorkflowRun(runId) {
+  return request(`/api/workflows/runs/${runId}/cancel`, { method: "POST" });
+}
+
+// ── Workflow credentials (the secret is never returned by list) ──────────────
+export function fetchWorkflowCredentials() {
+  return request("/api/workflows/credentials");
+}
+
+export function createWorkflowCredential({ name, type = "bearer", secret = {} }) {
+  return request("/api/workflows/credentials", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, type, secret }),
+  });
+}
+
+export function deleteWorkflowCredential(credentialId) {
+  return request(`/api/workflows/credentials/${credentialId}`, { method: "DELETE" });
+}
+
+// ── Workflow template gallery ────────────────────────────────────────────────
 export function fetchWorkflowTemplates() {
   return request("/api/workflows/templates");
 }

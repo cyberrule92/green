@@ -57,6 +57,7 @@ from deferred_queue import get_deferred_queue
 from workflows import (
     WorkflowStore, WorkflowEngine, WorkflowServices,
     validate_graph, node_types_public, cron_matches,
+    secret_encrypt, secret_decrypt,
 )
 from model_zoo import get_model_zoo
 from model_zoo_updater import get_zoo_updater
@@ -234,6 +235,19 @@ def _resolve_audit_hmac_key() -> bytes:
 
 
 AUDIT_HMAC_KEY = _resolve_audit_hmac_key()
+
+
+# Encryption key for stored workflow HTTP credentials. Prefer a dedicated
+# WF_SECRET_KEY; otherwise reuse the audit key so credentials are still
+# encrypted at rest. With neither set (dev), the audit key is ephemeral per
+# process, so stored credentials will not decrypt after a restart -- set
+# WF_SECRET_KEY in production for durable credentials.
+def _resolve_wf_secret_key() -> bytes:
+    raw = os.getenv("WF_SECRET_KEY", "").strip()
+    return raw.encode("utf-8") if raw else AUDIT_HMAC_KEY
+
+
+WF_SECRET_KEY = _resolve_wf_secret_key()
 
 # Multi-region: fetch zone signals at startup + cache
 MULTI_REGION_ENABLED = os.getenv("MULTI_REGION_ENABLED", "false").lower() in {"1", "true", "yes"}
@@ -5543,6 +5557,12 @@ class WorkflowRunModel(BaseModel):
     input: dict[str, Any] | None = None
 
 
+class WorkflowCredentialModel(BaseModel):
+    name: str
+    type: str = "bearer"                   # bearer | basic | header
+    secret: dict[str, Any] = {}            # {token} | {username,password} | {name,value}
+
+
 class WorkflowApprovalModel(BaseModel):
     node_id: str | None = None            # single-approval convenience
     approved: bool = True
@@ -5612,11 +5632,55 @@ def _wf_image(prompt: str, steps: int = 24) -> dict[str, Any]:
     # placeholder fallback, so this works even with no diffusion endpoint set.
     candidate = {"model_variant": "image-gen", "diffusion_steps": steps}
     gen = run_image_generation(candidate, prompt, steps)
-    return {"image": gen.get("image_data_uri"), "backend": gen.get("backend"), "carbon_g": 0.0}
+    return {"image": gen.get("image_data_uri"), "backend": gen.get("backend"),
+            "carbon_g": _estimate_image_carbon_g(int(gen.get("steps") or steps))}
+
+
+def _estimate_image_carbon_g(steps: int) -> float:
+    """Carbon estimate for one diffusion run at the live grid CI.
+
+    run_image_generation reports no carbon of its own -- it is a pluggable
+    NIM/HF/placeholder call -- so the node priced its output at a hardcoded 0.0,
+    which quietly told every workflow receipt that image generation was free.
+    Priced here via model_zoo, the same way the chat path prices a routed
+    candidate. Duration is taken as linear in denoise steps at ~0.12 s/step,
+    which is an SDXL-class figure and the weakest assumption in this function.
+    """
+    model_id = "black-forest-labs/flux.1-dev" if NIM_FLUX_URL else "stabilityai/stable-diffusion-xl"
+    duration_s = max(0.1, steps * 0.12)
+    try:
+        breakdown = get_model_zoo().compute_total_carbon(
+            model_id=model_id,
+            grid_carbon_g_per_kwh=_wf_grid_ci(),
+            inference_duration_s=duration_s,
+        )
+        return float(breakdown.get("total_carbon_g", 0.0) or 0.0)
+    except Exception:  # noqa: BLE001 - carbon accounting is best-effort telemetry
+        logger.debug("image carbon estimate failed", exc_info=True)
+        return 0.0
 
 
 def _wf_grid_ci() -> float:
     return safe_float(fetch_grid_signal().get("carbon_intensity"), 400.0)
+
+
+def _wf_decrypt_credential(cred_id: str, tenant_id: str) -> dict[str, Any] | None:
+    """Resolve a credential id → {type, secret:{...}} with the secret decrypted.
+
+    Called only at HTTP-node dispatch. The lookup is scoped to the running
+    workflow's tenant: the node's URL is author-controlled, so resolving another
+    tenant's credential here would post their secret to a server of the author's
+    choosing. The plaintext goes into request headers and nowhere else.
+    """
+    rec = workflow_store.get_credential_token(cred_id, tenant_id)
+    if not rec:
+        return None
+    try:
+        secret = json.loads(secret_decrypt(rec["secret_token"], WF_SECRET_KEY))
+    except (ValueError, json.JSONDecodeError) as exc:
+        logger.warning("credential %s failed to decrypt: %s", cred_id, exc)
+        return None
+    return {"type": rec["type"], "secret": secret}
 
 
 _WORKFLOW_ENGINE: WorkflowEngine | None = None
@@ -5630,19 +5694,36 @@ def _get_workflow_engine() -> WorkflowEngine:
             agent_run=_wf_agent, image_gen=_wf_image, grid_ci=_wf_grid_ci,
             # Sub-workflow node resolves saved workflows by id (tenant-agnostic).
             load_workflow=lambda wid: workflow_store.get_workflow(wid),
+            decrypt_credential=_wf_decrypt_credential,
         ))
     return _WORKFLOW_ENGINE
+
+
+# In-flight run cancel tokens, keyed by run id. A cancel request sets the event;
+# the engine checks it between supersteps and finalises the run as 'cancelled'.
+_wf_run_tokens: dict[str, asyncio.Event] = {}
+
+# How many error-handler hops may chain off one failing run. 1 means: a normal
+# run may dispatch its handler, but a failing handler dispatches nothing further.
+WF_MAX_ERROR_DEPTH = int(os.getenv("WF_MAX_ERROR_DEPTH", "1"))
 
 
 async def _execute_workflow_run(
     wf: dict[str, Any], run_id: str, trigger_input: Any,
     resume_state: dict[str, Any] | None = None,
     approvals: dict[str, dict[str, Any]] | None = None,
+    error_depth: int = 0,
 ) -> None:
     """Background task: run (or resume) one workflow and stream node states into
     the run row. A ``paused`` outcome parks the run as ``awaiting_approval`` with
-    its resume blob; a later approval calls back in with ``resume_state``."""
+    its resume blob; a later approval calls back in with ``resume_state``. On a
+    ``failed``/``cancelled`` outcome an ``on_error_workflow_id`` (if declared) is
+    dispatched with the error context as its trigger payload.
+
+    ``error_depth`` is how many error-handler hops led here (0 for a normal run).
+    It bounds the chain, so a self-referencing or cyclic handler terminates."""
     engine = _get_workflow_engine()
+    cancel_event = _wf_run_tokens.setdefault(run_id, asyncio.Event())
 
     def _progress(states: list[dict[str, Any]], carbon: float) -> None:
         workflow_store.update_run(run_id, node_states=states, total_carbon_g=round(carbon, 6))
@@ -5652,6 +5733,7 @@ async def _execute_workflow_run(
             wf["graph"], trigger_input=trigger_input,
             tenant_id=wf["tenant_id"], on_progress=_progress,
             resume_state=resume_state, approvals=approvals,
+            cancel_event=cancel_event,
         )
         if outcome["status"] == "paused":
             workflow_store.update_run(
@@ -5665,13 +5747,48 @@ async def _execute_workflow_run(
                 total_carbon_g=outcome["total_carbon_g"], node_states=outcome["node_states"],
                 error=outcome.get("error"), engine_state=None, awaiting=[],
             )
+            if outcome["status"] in ("failed", "cancelled"):
+                _dispatch_error_workflow(wf, run_id, outcome, error_depth)
     except Exception as exc:  # noqa: BLE001 - surface any engine crash on the run
         logger.exception("workflow run %s crashed", run_id)
         workflow_store.update_run(
             run_id, status="failed", finished_at=workflows_now(),
             error=f"{type(exc).__name__}: {exc}",
         )
+    finally:
+        _wf_run_tokens.pop(run_id, None)
     workflow_store.update_workflow(wf["id"], tenant_id=wf["tenant_id"], last_run_at=workflows_now())
+
+
+def _dispatch_error_workflow(wf: dict[str, Any], run_id: str, outcome: dict[str, Any],
+                             error_depth: int = 0) -> None:
+    """Run the workflow's ``on_error_workflow_id`` (from graph settings) as a
+    failure handler, with the error context as its trigger payload.
+
+    Bounded by ``WF_MAX_ERROR_DEPTH``: without it, a handler pointing at itself
+    (or any A->B->A cycle) respawns on every failure and never terminates."""
+    err_wf_id = ((wf.get("graph") or {}).get("settings") or {}).get("on_error_workflow_id")
+    if not err_wf_id:
+        return
+    if error_depth >= WF_MAX_ERROR_DEPTH:
+        logger.warning("error-workflow chain depth %d reached for %s; not dispatching %s",
+                       error_depth, wf["id"], err_wf_id)
+        return
+    if err_wf_id == wf["id"]:
+        logger.warning("workflow %s declares itself as its error handler; skipping", wf["id"])
+        return
+    err_wf = workflow_store.get_workflow(err_wf_id, tenant_id=wf["tenant_id"])
+    if not err_wf or not err_wf.get("enabled"):
+        logger.info("error workflow %s missing or disabled; skipping", err_wf_id)
+        return
+    failed = next((s["id"] for s in outcome.get("node_states", [])
+                   if s.get("status") == "failed"), None)
+    payload = {"workflow_id": wf["id"], "run_id": run_id,
+               "error": outcome.get("error"), "failed_node": failed}
+    try:
+        _start_workflow_run(err_wf, "error", payload, error_depth=error_depth + 1)
+    except Exception:  # noqa: BLE001 - never let error handling crash the caller
+        logger.exception("failed to dispatch error workflow %s", err_wf_id)
 
 
 def workflows_now() -> str:
@@ -5679,9 +5796,84 @@ def workflows_now() -> str:
     return utc_now_iso()
 
 
-def _start_workflow_run(wf: dict[str, Any], trigger: str, trigger_input: Any) -> dict[str, Any]:
+def _wf_full_power_w() -> float | None:
+    """Power draw of the always-on 'full' candidate, for the receipt baseline."""
+    for target in load_routing_targets(ROUTING_TARGETS_PATH):
+        if target.get("model_variant") == "full" and target.get("hardware") == "vgpu":
+            power = safe_float(target.get("power_w"), 0.0)
+            return power or None
+    return None
+
+
+def _wf_power_by_variant() -> dict[str, float]:
+    """model_variant → power draw, preferring the vGPU row for each variant."""
+    out: dict[str, float] = {}
+    for target in load_routing_targets(ROUTING_TARGETS_PATH):
+        variant = target.get("model_variant")
+        power = safe_float(target.get("power_w"), 0.0)
+        if not variant or power <= 0:
+            continue
+        if variant not in out or target.get("hardware") == "vgpu":
+            out[variant] = power
+    return out
+
+
+def _build_run_receipt(run: dict[str, Any]) -> dict[str, Any]:
+    """Carbon receipt for a run: the actual total, an approximate
+    'always-full-cloud' counterfactual, and the difference.
+
+    Each model node's carbon is re-priced by the ratio of the full candidate's
+    power draw to the variant that actually served it. Power is the right basis
+    because operational carbon here is power x duration (see
+    model_zoo.compute_operational_carbon) -- FLOP counts do not enter it.
+
+    This is an APPROXIMATION and is labelled as one: node_states persist carbon
+    and model_variant but not token counts or per-node duration of the model call
+    itself, so the counterfactual assumes the same wall-clock on the bigger
+    model. A larger model is generally slower, so the saving is if anything
+    understated. Nodes with no model_variant contribute equally to both sides.
+    """
+    power_by_variant = _wf_power_by_variant()
+    full_power = _wf_full_power_w()
+    per_node: list[dict[str, Any]] = []
+    by_model: dict[str, float] = {}
+    total = 0.0
+    baseline = 0.0
+    for state in run.get("node_states", []):
+        carbon = safe_float(state.get("carbon_g"), 0.0)
+        total += carbon
+        output = state.get("output") if isinstance(state.get("output"), dict) else {}
+        variant = output.get("model_variant") if isinstance(output, dict) else None
+        node_baseline = carbon
+        if variant and full_power and power_by_variant.get(variant):
+            node_baseline = carbon * (full_power / power_by_variant[variant])
+        baseline += node_baseline
+        per_node.append({"id": state.get("id"), "type": state.get("type"),
+                         "model_variant": variant, "carbon_g": round(carbon, 6)})
+        if variant:
+            by_model[variant] = round(by_model.get(variant, 0.0) + carbon, 6)
+    savings = max(0.0, baseline - total)
+    pct = round((savings / baseline) * 100, 1) if baseline > 0 else 0.0
+    return {
+        "run_id": run.get("id"),
+        "total_g": round(total, 6),
+        "baseline_g": round(baseline, 6),
+        "savings_g": round(savings, 6),
+        "savings_pct": pct,
+        "per_node": per_node,
+        "by_model": by_model,
+        "approximate": True,
+        "basis": "power_w ratio vs the 'full' candidate; equal duration assumed",
+    }
+
+
+def _start_workflow_run(wf: dict[str, Any], trigger: str, trigger_input: Any,
+                        error_depth: int = 0) -> dict[str, Any]:
     """Validate, create a 'running' run row, and dispatch execution in the
-    background so the caller gets a run id immediately (poll for the outcome)."""
+    background so the caller gets a run id immediately (poll for the outcome).
+
+    ``error_depth`` is non-zero only when this run *is* an error handler; it is
+    forwarded so the chain stays bounded (see ``_dispatch_error_workflow``)."""
     validate_graph(wf["graph"])  # raises ValueError → 400 before any carbon
     seed_states = [
         {"id": n["id"], "type": n.get("type"),
@@ -5690,7 +5882,8 @@ def _start_workflow_run(wf: dict[str, Any], trigger: str, trigger_input: Any) ->
         for n in wf["graph"].get("nodes", [])
     ]
     run = workflow_store.create_run(wf["id"], wf["tenant_id"], trigger, seed_states)
-    asyncio.create_task(_execute_workflow_run(wf, run["id"], trigger_input))
+    asyncio.create_task(_execute_workflow_run(wf, run["id"], trigger_input,
+                                              error_depth=error_depth))
     return run
 
 
@@ -5825,6 +6018,32 @@ def api_workflow_create(payload: WorkflowModel,
     )
 
 
+# NOTE: /credentials is declared before /{workflow_id} so it is not parsed as an id.
+@app.get("/api/workflows/credentials")
+def api_workflow_credentials_list(tenant_id: str = Depends(resolve_tenant)) -> dict[str, Any]:
+    """List credentials for the tenant — id/name/type only, never the secret."""
+    return {"credentials": workflow_store.list_credentials(tenant_id=tenant_id)}
+
+
+@app.post("/api/workflows/credentials")
+def api_workflow_credential_create(payload: WorkflowCredentialModel,
+                                   tenant_id: str = Depends(resolve_tenant)) -> dict[str, Any]:
+    """Store an encrypted credential. The response never echoes the secret."""
+    if payload.type not in ("bearer", "basic", "header"):
+        raise HTTPException(status_code=400, detail="type must be bearer | basic | header")
+    token = secret_encrypt(json.dumps(payload.secret or {}), WF_SECRET_KEY)
+    return workflow_store.create_credential(
+        name=payload.name, cred_type=payload.type, secret_token=token, tenant_id=tenant_id)
+
+
+@app.delete("/api/workflows/credentials/{credential_id}")
+def api_workflow_credential_delete(credential_id: str,
+                                   tenant_id: str = Depends(resolve_tenant)) -> dict[str, Any]:
+    if not workflow_store.delete_credential(credential_id, tenant_id=tenant_id):
+        raise HTTPException(status_code=404, detail=f"unknown credential {credential_id}")
+    return {"status": "deleted", "id": credential_id}
+
+
 @app.get("/api/workflows/{workflow_id}")
 def api_workflow_get(workflow_id: str,
                      tenant_id: str = Depends(resolve_tenant)) -> dict[str, Any]:
@@ -5842,6 +6061,14 @@ def api_workflow_update(workflow_id: str, payload: WorkflowModel,
             validate_graph(payload.graph)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=f"invalid graph: {exc}") from exc
+        # Refuse a self-referencing failure handler here so the author gets a 400,
+        # rather than discovering at runtime that it was silently skipped.
+        err_id = (payload.graph.get("settings") or {}).get("on_error_workflow_id")
+        if err_id and err_id == workflow_id:
+            raise HTTPException(
+                status_code=400,
+                detail="on_error_workflow_id cannot reference the workflow itself",
+            )
     wf = workflow_store.update_workflow(
         workflow_id, tenant_id=tenant_id, name=payload.name,
         description=payload.description, enabled=payload.enabled, graph=payload.graph,
@@ -5943,6 +6170,31 @@ async def api_workflow_run_approve(run_id: str, payload: WorkflowApprovalModel,
     asyncio.create_task(_execute_workflow_run(
         wf, run_id, state.get("trigger_input"), resume_state=state, approvals=decisions))
     return {"status": "resumed", "run_id": run_id, "decided": list(decisions)}
+
+
+@app.get("/api/workflows/runs/{run_id}/receipt")
+def api_workflow_run_receipt(run_id: str,
+                             tenant_id: str = Depends(resolve_tenant)) -> dict[str, Any]:
+    """Carbon receipt: actual total, per-node and per-model breakdown, and the
+    approximate saving against an always-full-cloud counterfactual."""
+    run = workflow_store.get_run(run_id)
+    if run is None or run.get("tenant_id") not in (tenant_id, None):
+        raise HTTPException(status_code=404, detail=f"unknown run {run_id}")
+    return _build_run_receipt(run)
+
+
+@app.post("/api/workflows/runs/{run_id}/cancel")
+def api_workflow_run_cancel(run_id: str,
+                            tenant_id: str = Depends(resolve_tenant)) -> dict[str, Any]:
+    """Cooperatively cancel an in-flight run. The engine finalises it as
+    'cancelled' between supersteps; nodes already running finish first."""
+    run = workflow_store.get_run(run_id)
+    if run is None or run.get("tenant_id") not in (tenant_id, None):
+        raise HTTPException(status_code=404, detail=f"unknown run {run_id}")
+    if run.get("status") != "running":
+        raise HTTPException(status_code=409, detail=f"run is '{run.get('status')}', not running")
+    _wf_run_tokens.setdefault(run_id, asyncio.Event()).set()
+    return {"status": "cancelling", "run_id": run_id}
 
 
 @app.get("/api/benchmark")

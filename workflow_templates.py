@@ -1,6 +1,6 @@
 """Seeded workflow templates — the gallery behind the Workflows builder.
 
-Each template is a *runnable* starting-point graph derived from the 25 use cases
+Each template is a *runnable* starting-point graph derived from the use cases
 in the orchestration doc. They are authored compactly here (nodes + edges) and
 auto-laid-out into canvas positions; ``build_template`` validates every graph
 against the engine's ``validate_graph`` so a broken template can never ship.
@@ -88,13 +88,15 @@ _LABELS = {
     "llm": "LLM", "rag_query": "RAG retrieve", "agent_task": "Coding agent", "guardrail": "Guardrail",
     "image_gen": "Image gen", "http_request": "HTTP", "transform": "Transform", "if": "IF",
     "carbon_gate": "Carbon gate", "merge": "Merge", "subworkflow": "Sub-workflow", "approval": "Approval",
+    "switch": "Switch", "filter": "Filter", "wait": "Wait", "set_variables": "Set variables",
+    "notify": "Notify", "error_trigger": "Error trigger",
 }
 
 _EX = "https://example.com"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# The 25 templates
+# The template gallery
 # ─────────────────────────────────────────────────────────────────────────────
 TEMPLATES: list[dict[str, Any]] = [
 
@@ -1144,6 +1146,46 @@ TEMPLATES: list[dict[str, Any]] = [
                  "business risk before tickets are opened.",
         carbon="One prioritisation call per day, grounded in your asset context.",
         analog="LangChain retrieval-augmented prioritisation."),
+
+    # ── Flow-logic showcases (Switch / Set-variables / Filter) ───────────────
+    _build(
+        "priority-switch-router", "Priority-based multi-way router", "Customer Operations",
+        "Classify an inbound request, stash the label in $vars, then Switch to the right handler by priority.",
+        [("t", "webhook", {}),
+         ("cls", "llm", {"prompt": "Reply with exactly one word — urgent, normal, or low — for this request:\n{{ $trigger.message }}"}),
+         ("vars", "set_variables", {"fields": {"priority": "{{ $node.cls.text }}", "received_at": "{{ $now }}"}}),
+         ("sw", "switch", {"cases": [
+             {"handle": "urgent", "field": "{{ $vars.priority }}", "op": "contains", "value": "urgent"},
+             {"handle": "low", "field": "{{ $vars.priority }}", "op": "contains", "value": "low"}],
+          "default_handle": "normal"}),
+         ("page", "notify", {"channel": "webhook", "target": f"{_EX}/oncall/page",
+                             "message": "URGENT ({{ $vars.received_at }}): {{ $trigger.message }}"}),
+         ("queue", "http_request", {"method": "POST", "url": f"{_EX}/queue/normal", "body": "{{ $trigger.message }}"}),
+         ("digest", "http_request", {"method": "POST", "url": f"{_EX}/queue/low", "body": "{{ $trigger.message }}"})],
+        [("t", "cls"), ("cls", "vars"), ("vars", "sw"),
+         ("sw", "page", "urgent"), ("sw", "queue", "normal"), ("sw", "digest", "low")],
+        ["routing", "switch", "set_variables"],
+        scenario="A single classifier feeds a multi-way Switch: urgent requests page on-call, normal ones queue, "
+                 "low-priority ones go to a digest — the label is stored once in $vars and reused.",
+        carbon="One classification call routes the whole request; no redundant re-classification per branch.",
+        analog="n8n Switch node + Set node."),
+
+    _build(
+        "carbon-filtered-batch", "Carbon-filtered batch enrichment", "Sustainability & ESG",
+        "Set a budget in $vars, filter out records already enriched, and only run the LLM when the grid is clean.",
+        [("t", "schedule", {"cron": "0 * * * *"}),
+         ("cfg", "set_variables", {"fields": {"max_items": "50", "run_id": "{{ $now }}"}}),
+         ("keep", "filter", {"field": "{{ $trigger.needs_enrichment }}", "op": "==", "value": "true"}),
+         ("gate", "carbon_gate", {"threshold_g": 250}),
+         ("enrich", "llm", {"prompt": "Enrich this record (run {{ $vars.run_id }}):\n{{ $trigger.record }}"}),
+         ("store", "http_request", {"method": "POST", "url": f"{_EX}/records/enriched", "body": "{{ $node.enrich.text }}"})],
+        [("t", "cfg"), ("cfg", "keep"), ("keep", "gate"),
+         ("gate", "enrich", "green"), ("enrich", "store")],
+        ["batch", "filter", "carbon"],
+        scenario="An hourly job filters to records that still need enrichment and only spends model carbon when the "
+                 "grid is below threshold — the run id and cap live in $vars for the whole run.",
+        carbon="Filter prunes already-done work before any model call; the carbon gate defers the rest to clean windows.",
+        analog="n8n Filter node + IF, made carbon-aware."),
 ]
 
 
