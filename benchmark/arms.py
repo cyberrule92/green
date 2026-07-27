@@ -12,6 +12,20 @@ An arm is a function from a prompt row to the request parameters sent to
                       sensible heuristic is the actual claim.
     css               no preference. The real router: CSS scoring, RL weights,
                       quality/latency estimator, deferral.
+    always-coder7b    every prompt pinned to the 4-bit AWQ 7B. Not a routing
+                      strategy -- a measurement. CSS ranks this candidate last
+                      because its DECLARED accuracy (0.93) is only +0.01 over
+                      `full` (0.92) while its spec carbon is 2.37x higher, so a
+                      carbon-dominant score will never choose it. But declared
+                      accuracy is a spec constant and the prior run measured
+                      `full` delivering 0.793 actual against its declared 0.92 --
+                      so the declared figures compress the real gap by an unknown
+                      amount. This arm answers the question those constants
+                      cannot: does a genuinely larger model deliver enough extra
+                      quality to justify 2.37x the carbon? If yes, the zoo's
+                      accuracy_baseline is wrong and should be corrected from
+                      measurement, which would change what CSS picks. If no, the
+                      ladder has no better rung and CSS is right to ignore it.
 
 Two mechanics matter and both are load-bearing:
 
@@ -43,6 +57,7 @@ from typing import Any, Callable
 FULL = "local-vgpu-full"
 MEDIUM = "local-vgpu-medium"
 SMALL = "local-vgpu-small"
+CODER7B = "local-vgpu-coder-7b"
 
 # Keywords a carbon-blind engineer would reach for: "this looks hard, use the
 # big model". Deliberately naive — that is the point of the baseline.
@@ -77,6 +92,10 @@ def arm_static_heuristic(row: dict[str, Any]) -> dict[str, Any]:
     return {"model_preference": _static_heuristic_pin(row["prompt"]), "accuracy_floor": 0.0}
 
 
+def arm_always_coder7b(row: dict[str, Any]) -> dict[str, Any]:
+    return {"model_preference": CODER7B, "accuracy_floor": 0.0}
+
+
 def arm_css(row: dict[str, Any]) -> dict[str, Any]:
     # No pin, no floor. The router decides. This is the system under test.
     return {}
@@ -86,6 +105,7 @@ ARMS: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {
     "always-full": arm_always_full,
     "static-heuristic": arm_static_heuristic,
     "css": arm_css,
+    "always-coder7b": arm_always_coder7b,
 }
 
 # Tenant per arm keeps RL/cache/budget state from mixing even if a freeze flag
