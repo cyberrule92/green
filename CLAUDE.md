@@ -46,7 +46,22 @@ curl http://localhost:8001/health        # vLLM medium
 curl http://localhost:8002/health        # vLLM full
 ```
 
-There are no automated tests. All configuration comes from `.env` (see `.env.example` for all options).
+### Tests
+
+```bash
+python3 -m pytest          # whole suite (config in pyproject.toml)
+python3 workflows.py       # engine smoke test, standalone
+python3 workflow_templates.py
+```
+
+`tests/` covers the carbon arithmetic (golden values against
+`tests/fixtures/model_zoo_min.json`, plus invariants and bounds on the shipped
+zoo) and the RL weight projection. It deliberately does **not** import
+`decision_engine` — that needs fastapi and the full backend stack — so tests
+target the dependency-light modules directly and construct isolated instances
+via explicit paths rather than patching import-time constants.
+
+All configuration comes from `.env` (see `.env.example` for all options).
 
 ---
 

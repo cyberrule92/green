@@ -1,0 +1,7 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+# Keep the suite importable without the full backend stack: tests target the
+# dependency-light modules (model_zoo, rl_controller, workflows, ...) directly
+# rather than importing decision_engine, which needs fastapi + the vLLM config.
+filterwarnings = ["ignore::DeprecationWarning"]
