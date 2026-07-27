@@ -122,11 +122,28 @@ class ModelZooService:
         token_count: int = 256,
     ) -> dict[str, float]:
         """
-        Compute operational carbon using the LLMCarbon formula:
-            C_op = (FLOPs / HE) × TDP × PUE × CI × t / (1000 × 3600)
+        Operational carbon for one inference, from measured wall-clock time:
+
+            energy_kwh = TDP × t × PUE / (HE_eff × 1000 × 3600)
+            C_op (g)   = energy_kwh × CI × region_carbon_multiplier
 
         For MoE models HE is adjusted for all-to-all communication overhead:
-            HE_moe = HE × (1 - all_to_all_overhead_ratio)
+            HE_eff = HE × (1 - all_to_all_overhead_ratio)
+
+        **FLOPs and token_count do not enter the result.** They are computed and
+        returned (``flop_per_token``, ``total_flops``, ``sparse_path``) as
+        reporting metadata only. Energy here is power × time, which is the
+        defensible quantity once a duration has actually been measured;
+        multiplying by a FLOP estimate as well would double-count the same work.
+        The LLMCarbon FLOP form is the alternative you reach for when you have no
+        measured duration — this codebase always has one, so it uses the direct
+        form. Two consequences worth knowing when reading a number out of here:
+        a 10-token and a 10,000-token response of equal duration cost the same,
+        and the MoE sparse-FLOP branch below changes what is *reported* but not
+        what is *charged* (the MoE penalty is carried entirely by HE_eff).
+
+        ``compute_request_carbon`` is the ex-post sibling of this function and
+        uses the identical energy term; the two must not diverge.
 
         Returns dict with breakdown fields.
         """
@@ -134,7 +151,9 @@ class ModelZooService:
         if not model:
             return {"total_carbon_g": 0.0, "error": f"Model {model_id} not found"}
 
-        # Choose FLOP count: sparse for MoE, dense otherwise
+        # Reporting metadata only — see the docstring. Neither of these feeds
+        # energy_kwh below; they are surfaced for /api/model-zoo/{id}/carbon and
+        # for the MoE accounting in routing_policies.
         if model.get("moe") and model.get("flop_count_per_token_sparse"):
             flop_per_token = float(model["flop_count_per_token_sparse"])
             sparse_path = True
@@ -165,10 +184,8 @@ class ModelZooService:
         tdp_w = float(model.get("power_tdp_w", 100.0))
         pue = float(model.get("pue", 1.3))
 
-        # LLMCarbon operational formula
-        # C_op (gCO2) = (FLOPs / HE_eff) × TDP × PUE × CI × t  [all in consistent units]
-        # Simplified to power-based form: energy = TDP × t × PUE / HE_eff (Joules-equivalent factor)
-        # Then C_op = energy_kwh × CI_g_per_kwh
+        # energy (kWh) = TDP × t × PUE / HE_eff, converted from W·s via 1000×3600.
+        # Note what is absent: no FLOP or token term. See the docstring.
         energy_kwh = (tdp_w * inference_duration_s * pue) / (he_effective * 1000.0 * 3600.0)
         regional_multiplier = float(model.get("region_carbon_multiplier", 1.0))
         op_carbon_g = energy_kwh * grid_carbon_g_per_kwh * regional_multiplier

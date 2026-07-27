@@ -1,6 +1,13 @@
 {
   "version": "2026-04-15",
   "refresh_policy": "quarterly",
+  "_field_notes": {
+    "flop_count_per_token": "Reporting metadata only. Operational carbon is computed as TDP x duration x PUE / hardware_efficiency, so this value does NOT affect any carbon number. It is surfaced via /api/model-zoo/{id}/carbon and used for MoE accounting in routing_policies. Editing it will not change a gCO2 figure.",
+    "flop_count_per_token_sparse": "Reporting metadata only, same as flop_count_per_token. Selected for MoE entries. The MoE carbon penalty is carried by all_to_all_overhead_ratio via hardware_efficiency, not by this field.",
+    "power_tdp_w": "Drives operational carbon directly. A spec constant, not a reading -- vGPU slices do not expose power.draw -- so the operational term is an upper bound on true draw.",
+    "hardware_efficiency": "Divisor in the energy term; must be in (0, 1]. Clamped to >= 0.05 at use.",
+    "all_to_all_overhead_ratio": "Must be in [0, 1). Reduces effective hardware_efficiency for MoE entries; a value of 1.0 would zero the divisor."
+  },
   "models": [
     {
       "id": "local-vgpu-small",
