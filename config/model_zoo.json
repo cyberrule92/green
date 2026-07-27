@@ -50,7 +50,9 @@
         "op_carbon_per_1k_tokens_g": 0.0012,
         "emb_carbon_per_1k_tokens_g": 8e-05
       },
-      "max_output_tokens": 256
+      "max_output_tokens": 256,
+      "expected_output_tokens": 108,
+      "expected_output_tokens_basis": "measured:len-aware-01"
     },
     {
       "id": "local-vgpu-medium",
@@ -93,7 +95,9 @@
         "op_carbon_per_1k_tokens_g": 0.0038,
         "emb_carbon_per_1k_tokens_g": 8e-05
       },
-      "max_output_tokens": 384
+      "max_output_tokens": 384,
+      "expected_output_tokens": 108,
+      "expected_output_tokens_basis": "measured:len-aware-01"
     },
     {
       "id": "local-vgpu-full",
@@ -135,7 +139,9 @@
         "op_carbon_per_1k_tokens_g": 0.0073,
         "emb_carbon_per_1k_tokens_g": 8e-05
       },
-      "max_output_tokens": 1024
+      "max_output_tokens": 1024,
+      "expected_output_tokens": 94,
+      "expected_output_tokens_basis": "measured:len-aware-01"
     },
     {
       "id": "local-vgpu-moe",
@@ -242,7 +248,9 @@
         "op_carbon_per_1k_tokens_g": 0.0073,
         "emb_carbon_per_1k_tokens_g": 0.0001
       },
-      "max_output_tokens": 768
+      "max_output_tokens": 768,
+      "expected_output_tokens": 242,
+      "expected_output_tokens_basis": "estimated_from_sibling"
     },
     {
       "id": "local-vgpu-stem-science",
@@ -295,7 +303,9 @@
         "op_carbon_per_1k_tokens_g": 0.0073,
         "emb_carbon_per_1k_tokens_g": 0.0001
       },
-      "max_output_tokens": 768
+      "max_output_tokens": 768,
+      "expected_output_tokens": 242,
+      "expected_output_tokens_basis": "estimated_from_sibling"
     },
     {
       "id": "local-vgpu-stem-coding",
@@ -347,7 +357,9 @@
         "op_carbon_per_1k_tokens_g": 0.0068,
         "emb_carbon_per_1k_tokens_g": 0.0001
       },
-      "max_output_tokens": 1024
+      "max_output_tokens": 1024,
+      "expected_output_tokens": 242,
+      "expected_output_tokens_basis": "measured:len-aware-01"
     },
     {
       "id": "local-vgpu-coder-7b",
@@ -440,7 +452,9 @@
         "op_carbon_per_1k_tokens_g": 0.0006,
         "emb_carbon_per_1k_tokens_g": 1.8e-05
       },
-      "max_output_tokens": 256
+      "max_output_tokens": 256,
+      "expected_output_tokens": 108,
+      "expected_output_tokens_basis": "measured:len-aware-01"
     },
     {
       "id": "local-cpu-llama2-7b-fallback",
@@ -485,7 +499,9 @@
         "emb_carbon_per_1k_tokens_g": 1.8e-05
       },
       "notes": "Paper §4.3 names Llama2-7B as the always-available fallback model. Routed only when Decision Engine fails or all primary candidates are unavailable; high latency keeps CSS rank low for normal traffic.",
-      "max_output_tokens": 1024
+      "max_output_tokens": 1024,
+      "expected_output_tokens": 94,
+      "expected_output_tokens_basis": "measured:len-aware-01"
     },
     {
       "id": "us-west-gpu-medium",

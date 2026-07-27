@@ -793,11 +793,21 @@ def rank_routing_candidates(
             # of the previous "carbon is never touched by the estimator" rule: that
             # rule was meant to protect the greenest-feasible invariant, but a
             # carbon number blind to output length does not measure carbon.
+            # Per-candidate measured prior, falling back to the global reference
+            # for a candidate with no measurement. This is the part that works
+            # with a FROZEN router: the benchmark disables the estimator
+            # (QL_ESTIMATOR_ENABLED=false) so a purely learned length signal is
+            # inert there, and the first length-aware run came back with a
+            # byte-identical model mix because of exactly that. Config-declared
+            # priors are visible to CSS whether the estimator runs or not; the
+            # estimator then refines them per-prompt in production.
+            base_out = safe_float(target.get("expected_output_tokens"),
+                                  float(CSS_REFERENCE_OUTPUT_TOKENS))
             _ql_len = _ql_estimator().adjust(
                 semantic_profile, _variant_for_len, _baseline_acc_for_len, latency_ms,
-                baseline_output_tokens=float(CSS_REFERENCE_OUTPUT_TOKENS),
+                baseline_output_tokens=base_out,
             )
-            expected_out = safe_float(_ql_len.get("output_tokens"), CSS_REFERENCE_OUTPUT_TOKENS)
+            expected_out = safe_float(_ql_len.get("output_tokens"), base_out)
             # A per-variant cap is a hard ceiling on that expectation, because the
             # dispatcher will enforce the same cap via max_tokens.
             cap = safe_float(target.get("max_output_tokens"), 0.0)
