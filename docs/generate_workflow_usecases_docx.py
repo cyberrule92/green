@@ -40,28 +40,53 @@ NODE_CATALOG = [
     ("webhook", "Trigger", "Fires on POST /api/workflows/webhook/{id}; request body becomes the trigger output."),
     ("schedule", "Trigger", "Fires on a 5-field cron schedule while the workflow is enabled (autonomous)."),
     ("carbon_window", "Trigger", "Fires when grid carbon drops below a gCO2/kWh threshold — defers work to clean windows."),
+    ("error_trigger", "Trigger", "Runs this workflow as another workflow's failure handler; emits the error context."),
     ("llm", "AI action", "Chat completion through the CSS greenest-feasible router; reports real gCO2."),
     ("rag_query", "AI action", "Hybrid dense+sparse retrieval + cross-encoder rerank over the indexed knowledge base."),
     ("agent_task", "AI action", "One carbon-budgeted agentic coding task; escalates only on frozen-test evidence."),
     ("guardrail", "AI action", "NemoGuardrails safety rail (jailbreak/PII/harmful); branches safe / blocked."),
     ("image_gen", "AI action", "Carbon-capped diffusion via pluggable NIM endpoint with graceful placeholder fallback."),
-    ("http_request", "I/O", "Call any external HTTP(S) API; templated method/url/headers/body."),
+    ("http_request", "I/O", "Call any external HTTP(S) API; templated method/url/headers/body. Optional stored credential is injected as an auth header at dispatch and never appears in run state."),
+    ("notify", "I/O", "Send a webhook POST or an email (SMTP_*); a graceful logged no-op when SMTP is unconfigured."),
     ("transform", "Logic", "Build an output object from templated fields ({{ $node.id.field }})."),
     ("if", "Logic", "Branch on a comparison (==, !=, contains, >, <, empty…); handles true / false."),
+    ("switch", "Logic", "Multi-way branch: first matching case wins, else the default handle. One out-handle per case."),
+    ("filter", "Logic", "Gate a path: forward the input when the condition holds, otherwise prune everything downstream."),
+    ("wait", "Logic", "Pause the run for a bounded number of seconds (WF_MAX_WAIT_S), then forward the input."),
+    ("set_variables", "Logic", "Write templated values into the run-level $vars store, readable by any later node without an edge."),
     ("carbon_gate", "Logic", "Branch on live grid carbon; handles green / dirty."),
     ("merge", "Logic", "Join parallel branches; forwards merged upstream output."),
     ("subworkflow", "Logic", "Run another saved workflow as a node; optional item list fans out (map/batch)."),
     ("approval", "Logic", "Pause the run for a human to approve or reject (interrupt/resume); branches approved / rejected."),
 ]
 
+# The catalog above is curated prose, but it must not drift from the shipped
+# registry -- the whole point of this document is that it describes the product.
+_CATALOG_TYPES = {t for t, _c, _d in NODE_CATALOG}
+_REGISTRY_TYPES = set(_WF.NODE_TYPES)
+if _CATALOG_TYPES != _REGISTRY_TYPES:
+    raise SystemExit(
+        "NODE_CATALOG is out of sync with workflows.NODE_TYPES.\n"
+        f"  missing from this doc: {sorted(_REGISTRY_TYPES - _CATALOG_TYPES)}\n"
+        f"  no longer in the product: {sorted(_CATALOG_TYPES - _REGISTRY_TYPES)}"
+    )
+
 PARITY = [
     ("Directed graph of steps", "StateGraph nodes/edges", "Chains / Runnables", "Node + edge graph, topologically executed"),
     ("Conditional routing", "Conditional edges", "RouterChain", "if / carbon_gate / guardrail branch handles"),
+    ("Multi-way routing", "Conditional edges (n-way)", "RouterChain", "switch node — one out-handle per case, plus default"),
+    ("Filtering a path", "Conditional edge to END", "RunnableBranch", "filter node — prunes everything downstream on a miss"),
+    ("Run-scoped variables", "Shared state channel", "Memory", "set_variables writes $vars; survives an approval pause"),
+    ("Delays", "—", "—", "wait node, bounded by WF_MAX_WAIT_S"),
     ("Parallel execution", "Parallel supersteps", "RunnableParallel", "Independent nodes run concurrently per superstep"),
     ("Fan-out / map", "Send() / map", "Runnable.map / .batch", "subworkflow node with items list"),
     ("Composition / subgraphs", "Subgraphs", "SequentialChain nesting", "subworkflow node (depth-guarded)"),
     ("Retries & timeouts", "Node retry policy", "Runnable.with_retry", "Per-node retries / backoff / timeout_s"),
     ("Error handling", "Try/except nodes", "with_fallbacks", "Per-node on_error = stop | continue"),
+    ("Failure workflow", "—", "—", "graph.settings.on_error_workflow_id + error_trigger, depth-bounded"),
+    ("Cancellation", "—", "—", "POST /runs/{id}/cancel — cooperative, between supersteps"),
+    ("Credential store", "—", "—", "Encrypted at rest, tenant-scoped, injected at dispatch only"),
+    ("Notifications", "—", "—", "notify node (webhook / SMTP email)"),
     ("Tool calling", "ToolNode", "Tools / agents", "http_request, agent_task, rag_query, image_gen"),
     ("Retrieval augmentation", "Retriever node", "RetrievalQA", "rag_query node (hybrid + rerank)"),
     ("State / memory passing", "Shared state", "Memory", "Node outputs + {{ $node }} / {{ $input }} refs"),
@@ -306,7 +331,12 @@ API_ENDPOINTS = [
     ("GET", "/api/workflows/{id}/runs", "Recent runs for a workflow (summaries)."),
     ("GET", "/api/workflows/runs/{run_id}", "One run: status, per-node states, awaiting approvals, total gCO2."),
     ("POST", "/api/workflows/runs/{run_id}/approve", "Approve/reject a paused human-approval node and resume the run."),
-    ("GET", "/api/workflows/templates", "Gallery of the 75 seeded, runnable workflow templates (summaries)."),
+    ("GET", "/api/workflows/runs/{run_id}/receipt", "Carbon receipt: per-node and per-model gCO2, plus an approximate saving vs always-full-cloud."),
+    ("POST", "/api/workflows/runs/{run_id}/cancel", "Cooperatively cancel an in-flight run; nodes already running finish first."),
+    ("GET", "/api/workflows/credentials", "List the tenant's stored HTTP credentials — id, name and type only, never the secret."),
+    ("POST", "/api/workflows/credentials", "Store a credential (bearer | basic | header), encrypted at rest."),
+    ("DELETE", "/api/workflows/credentials/{id}", "Delete a stored credential."),
+    ("GET", "/api/workflows/templates", f"Gallery of the {len(_WT.TEMPLATES)} seeded, runnable workflow templates (summaries)."),
     ("POST", "/api/workflows/templates/{id}/instantiate", "Copy a template into a new editable workflow for the tenant."),
 ]
 
@@ -659,7 +689,7 @@ def build() -> None:
     r.font.color.rgb = DARK
     tag = doc.add_paragraph()
     tag.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    r = tag.add_run("Capabilities & 75 Industry Use Cases")
+    r = tag.add_run(f"Capabilities & {len(_WT.TEMPLATES)} Industry Use Cases")
     r.font.size = Pt(13)
     r.italic = True
     r.font.color.rgb = GREY
@@ -675,7 +705,8 @@ def build() -> None:
           "platform — a visual, node-based automation builder in the style of n8n, Make, and Activepieces, with "
           "the orchestration depth of LangGraph/LangChain and one property neither offers: every AI step is routed "
           "to the greenest model that can still do the job, and whole workflows can be deferred to low-carbon grid "
-          "windows. It then walks through 75 production use cases across nine industries.",
+          f"windows. It then walks through {len(_WT.TEMPLATES)} production use cases across "
+          f"{len({t['industry'] for t in _WT.TEMPLATES})} industries.",
           size=11)
 
     # ── 1. What it is ──
