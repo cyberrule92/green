@@ -28,6 +28,7 @@ import time
 import threading
 import zipfile
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -77,6 +78,7 @@ from routing_policies import (
     load_policy_config,
     load_routing_targets,
     rank_routing_candidates,
+    CSS_REFERENCE_OUTPUT_TOKENS,
     safe_float,
     variant_capability_tier,
 )
@@ -2257,6 +2259,26 @@ _VARIANT_MAX_MODEL_LEN: dict[str, int] = {
 }
 
 
+@lru_cache(maxsize=32)
+def _variant_output_cap(model_variant: str) -> int:
+    """Per-variant `max_output_tokens` from the model zoo, 0 when uncapped.
+
+    Read from the same registry CSS prices candidates against, so the router's
+    expectation and the dispatcher's ceiling cannot disagree. Cached because this
+    sits in the hot dispatch path and the zoo is reloaded explicitly, not per
+    request.
+    """
+    try:
+        for target in load_routing_targets(ROUTING_TARGETS_PATH):
+            if str(target.get("model_variant", "")).lower() == (model_variant or "").lower():
+                cap = int(safe_float(target.get("max_output_tokens"), 0.0))
+                if cap > 0:
+                    return cap
+    except Exception:  # noqa: BLE001 - never let a config read break dispatch
+        logger.debug("output cap lookup failed for %s", model_variant, exc_info=True)
+    return 0
+
+
 def run_vllm_inference(
     model_variant: str,
     prompt: str,
@@ -2311,6 +2333,17 @@ def run_vllm_inference(
     input_tokens = estimate_token_count(prompt, model_variant)
     safe_output = max(128, ctx_limit - input_tokens - 256)
     _max_tokens = min(_max_tokens, safe_output)
+
+    # Per-variant verbosity cap (model_zoo `max_output_tokens`). Carbon here is
+    # power x duration and duration scales with emitted tokens, so an unbounded
+    # output budget on a weak, rambling model is a direct carbon cost: the
+    # three-arm benchmark measured TinyLlama emitting 1.6x the tokens of
+    # Qwen2.5-1.5B on identical prompts. The caps sit well above observed mean
+    # lengths, so they act as a rail against runaway generation rather than
+    # routine truncation, and CSS prices each candidate against the same ceiling.
+    _variant_cap = _variant_output_cap(model_variant)
+    if _variant_cap > 0:
+        _max_tokens = min(_max_tokens, _variant_cap)
 
     payload = {
         "model": model_name,
@@ -3991,6 +4024,12 @@ async def process_chat_request(
                     baseline_latency_ms=_ql_baseline_latency,
                     actual_latency_ms=_actual_latency_ms,
                     accuracy_outcome=_accuracy_outcome,
+                    # Teaches the length head how verbose this variant actually is
+                    # on prompts like this one. The baseline is the same reference
+                    # CSS priced the candidate against, so the learned scale is a
+                    # ratio against a known constant rather than an absolute.
+                    baseline_output_tokens=float(CSS_REFERENCE_OUTPUT_TOKENS),
+                    actual_output_tokens=float(output_tokens or 0.0),
                 )
         except Exception as _exc:
             logger.warning("ql_estimator observe failed (non-critical): %s", _exc)

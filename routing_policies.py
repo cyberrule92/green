@@ -673,6 +673,14 @@ def _ql_estimator():
         return _NullEstimator()
 
 
+# Reference output length that each candidate's configured latency_ms_p50 is
+# taken to correspond to. A single global constant rather than a per-model figure
+# because the p50 values are spec numbers of unknown provenance; the per-variant
+# differentiation comes from the estimator's learned length head, which is
+# measured rather than declared.
+CSS_REFERENCE_OUTPUT_TOKENS = int(os.getenv("CSS_REFERENCE_OUTPUT_TOKENS", "96"))
+
+
 def rank_routing_candidates(
     request_context: dict[str, Any],
     routing_targets: list[dict[str, Any]],
@@ -747,12 +755,16 @@ def rank_routing_candidates(
     # candidate-set min-max normalisation per Section 3.4 of the paper.
     pre_scored: list[dict[str, Any]] = []
     for target in active_targets:
+        _variant_for_len = str(target.get("model_variant", "")).lower()
+        _baseline_acc_for_len = safe_float(
+            target.get("accuracy") or target.get("accuracy_baseline"), 0.5)
         zone = target.get("grid_zone", "local")
         effective_ci = grid_carbon
         if zone_carbon_map and zone in zone_carbon_map:
             effective_ci = zone_carbon_map[zone]
 
         diffusion_steps = 0
+        _len_meta: dict[str, Any] = {}   # text-only; diffusion carbon is step-based
         if target.get("diffusion"):
             # ── Diffusion (image-gen) carbon path: step-based, not token-based ──
             # Steps are trimmed toward the model floor as the grid dirties — the
@@ -766,11 +778,50 @@ def rank_routing_candidates(
         else:
             latency_ms = safe_float(target.get("latency_ms") or target.get("latency_ms_p50"),
                                     request_context["sla_ms"])
-            inference_duration_s = max(latency_ms / 1000.0, 0.05)
+            # ── Output-length-aware duration ──────────────────────────────────
+            # Carbon here is power x duration, and for autoregressive decoding
+            # duration is dominated by how many tokens the model chooses to emit.
+            # Pricing every candidate at the same static p50 made verbosity
+            # invisible to CSS, and the three-arm benchmark showed exactly what
+            # that costs: TinyLlama emitted 1.6x the tokens of Qwen2.5-1.5B on the
+            # same prompts (123.9 vs 75.5) and so burned MORE carbon, while CSS,
+            # unable to see it, kept selecting it and lost on both carbon (+10%)
+            # and quality (-14.7pp) against always-full.
+            #
+            # So the estimator's learned per-variant length head now scales the
+            # duration that carbon is computed from. This is a deliberate reversal
+            # of the previous "carbon is never touched by the estimator" rule: that
+            # rule was meant to protect the greenest-feasible invariant, but a
+            # carbon number blind to output length does not measure carbon.
+            _ql_len = _ql_estimator().adjust(
+                semantic_profile, _variant_for_len, _baseline_acc_for_len, latency_ms,
+                baseline_output_tokens=float(CSS_REFERENCE_OUTPUT_TOKENS),
+            )
+            expected_out = safe_float(_ql_len.get("output_tokens"), CSS_REFERENCE_OUTPUT_TOKENS)
+            # A per-variant cap is a hard ceiling on that expectation, because the
+            # dispatcher will enforce the same cap via max_tokens.
+            cap = safe_float(target.get("max_output_tokens"), 0.0)
+            if cap > 0:
+                expected_out = min(expected_out, cap)
+            expected_out = max(expected_out, 1.0)
+            length_factor = expected_out / max(float(CSS_REFERENCE_OUTPUT_TOKENS), 1.0)
+
+            inference_duration_s = max(latency_ms * length_factor / 1000.0, 0.05)
             op_g = compute_operational_carbon_llmcarbon(
-                target, effective_ci, inference_duration_s, token_count
+                target, effective_ci, inference_duration_s, int(expected_out)
             )
             emb_g = compute_embodied_carbon_llmcarbon(target, inference_duration_s)
+            # The latency CSS scores on must reflect the same expectation, or the
+            # router would price a verbose candidate's carbon honestly while still
+            # believing it is fast.
+            latency_ms = latency_ms * length_factor
+            _len_meta = {
+                "expected_output_tokens": round(expected_out, 1),
+                "length_scale": _ql_len.get("length_scale", 1.0),
+                "length_factor": round(length_factor, 4),
+                "max_output_tokens": int(cap) if cap > 0 else None,
+                "estimator_applied": bool(_ql_len.get("applied")),
+            }
         total_g = op_g + emb_g
 
         moe_comm_ms = compute_moe_all_to_all_latency_ms(target, token_count) if target.get("moe") else 0.0
@@ -788,7 +839,7 @@ def rank_routing_candidates(
             "target": target, "latency_ms": latency_ms, "moe_comm_ms": moe_comm_ms,
             "op_g": op_g, "emb_g": emb_g, "total_g": total_g,
             "effective_ci": effective_ci, "zone": zone, "region_raw": region_raw,
-            "diffusion_steps": diffusion_steps,
+            "diffusion_steps": diffusion_steps, "len_meta": _len_meta,
         })
 
     carbon_values = [p["total_g"] for p in pre_scored]
@@ -817,13 +868,20 @@ def rank_routing_candidates(
         cost_units = safe_float(target.get("cost_units"), 0.1)
         candidate_variant = str(target.get("model_variant", "")).lower()
 
-        # ── Learned quality/latency estimator (M5-adjacent) ──
-        # Refines the *static* per-model accuracy/latency baselines with a
-        # per-prompt correction learned online from observed outcomes (see
-        # quality_latency_estimator.py). Feeds ONLY the accuracy_score and
-        # latency_score below; carbon (op + embodied) is computed independently
-        # above and is deliberately untouched, so the greenest-feasible invariant
-        # holds. Cold-start / warm-up returns the baselines unchanged → no-op.
+        # ── Learned quality/latency/length estimator (M5-adjacent) ──
+        # Refines the *static* per-model baselines with a per-prompt correction
+        # learned online from observed outcomes (quality_latency_estimator.py).
+        # Cold-start / warm-up returns the baselines unchanged → no-op.
+        #
+        # The length head also feeds carbon, via the duration scaling applied in
+        # the pre-scoring loop above. That is intentional and is a change from the
+        # earlier design, which held carbon untouched to protect the
+        # greenest-feasible invariant: a carbon figure that cannot see how many
+        # tokens a model will emit is not measuring carbon, and the benchmark
+        # showed it selecting the dirtier candidate as a result.
+        #
+        # `latency_ms` here already carries the length factor from pre-scoring, so
+        # the latency head is applied on top of a length-adjusted baseline.
         _ql = _ql_estimator().adjust(
             semantic_profile, candidate_variant, baseline_accuracy, latency_ms
         )
@@ -903,6 +961,13 @@ def rank_routing_candidates(
             "ql_applied":            bool(_ql.get("applied")),
             "ql_accuracy_residual":  _ql.get("accuracy_residual", 0.0),
             "ql_latency_scale":      _ql.get("latency_scale", 1.0),
+            # Output-length expectation that priced this candidate's carbon. On
+            # the audit entry so a routing decision can be explained after the
+            # fact: "it looked greener because we expected it to say less".
+            "expected_output_tokens": pre.get("len_meta", {}).get("expected_output_tokens"),
+            "ql_length_scale":       pre.get("len_meta", {}).get("length_scale", 1.0),
+            "length_factor":         pre.get("len_meta", {}).get("length_factor", 1.0),
+            "max_output_tokens":     pre.get("len_meta", {}).get("max_output_tokens"),
             # Full carbon breakdown
             "estimated_carbon_g":    round(total_carbon_g, 8),
             "op_carbon_g":           round(op_carbon_g, 8),
