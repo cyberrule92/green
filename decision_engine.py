@@ -2401,6 +2401,87 @@ def log_decision(entry: dict[str, Any]) -> None:
     logger.info("Logged decision for conversation %s (signed)", entry.get("conversation_id"))
 
 
+_AUDIT_READ_BLOCK_BYTES = 64 * 1024
+
+
+def _iter_log_lines_reverse(path: Path, block_size: int = _AUDIT_READ_BLOCK_BYTES):
+    """Yield non-empty lines of a text file from last to first.
+
+    Seeks backwards in blocks rather than reading the whole file, so the cost of
+    answering a query is proportional to how far back the caller has to look —
+    not to the total size of the log, which only ever grows.
+    """
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        position = handle.tell()
+        carry = b""
+        while position > 0:
+            read_size = min(block_size, position)
+            position -= read_size
+            handle.seek(position)
+            chunk = handle.read(read_size) + carry
+            parts = chunk.split(b"\n")
+            # The first element may continue into the block before this one, so
+            # hold it back and prepend it on the next iteration.
+            carry = parts.pop(0)
+            for part in reversed(parts):
+                if part.strip():
+                    yield part.decode("utf-8", errors="replace")
+        if carry.strip():
+            yield carry.decode("utf-8", errors="replace")
+
+
+def _audit_entry_matches(
+    entry: dict[str, Any],
+    from_ts: float | None,
+    to_ts: float | None,
+    model_filter: str | None,
+    tier_filter: str | None,
+    tenant_filter: str | None,
+    min_carbon_g: float | None,
+) -> bool:
+    """Whether one audit entry satisfies every supplied filter."""
+    if from_ts is not None or to_ts is not None:
+        # An unparseable timestamp is not grounds for dropping the entry: it is
+        # still a signed record of a decision. Keep it and let the other filters
+        # decide, matching the previous behaviour.
+        try:
+            ts = datetime.fromisoformat(
+                str(entry.get("timestamp", "")).replace("Z", "+00:00")
+            ).timestamp()
+        except (TypeError, ValueError):
+            ts = None
+        if ts is not None:
+            if from_ts is not None and ts < from_ts:
+                return False
+            if to_ts is not None and ts > to_ts:
+                return False
+
+    if model_filter and entry.get("selected_model") != model_filter:
+        return False
+
+    # user_tier — standard|premium|esg|batch
+    if tier_filter and entry.get("user_tier") != tier_filter:
+        return False
+
+    # tenant_id — the multi-tenant isolation key
+    if tenant_filter:
+        entry_tenant = entry.get("tenant_id") or DEFAULT_TENANT_ID
+        if entry_tenant != tenant_filter:
+            return False
+
+    if min_carbon_g is not None:
+        entry_carbon = safe_float(
+            entry.get("estimated_carbon_g")
+            or (entry.get("selected_candidate") or {}).get("estimated_carbon_g"),
+            0.0,
+        )
+        if entry_carbon < min_carbon_g:
+            return False
+
+    return True
+
+
 def read_audit_log(
     from_ts: float | None = None,
     to_ts: float | None = None,
@@ -2412,60 +2493,38 @@ def read_audit_log(
 ) -> list[dict[str, Any]]:
     """Query the audit log with filters (Section 3.6.1 compliance query API).
 
+    Returns the **most recent** matching entries, newest first, capped at
+    ``max_entries``.
+
+    The log is append-only, so this reads it backwards. The previous
+    implementation scanned forward from the start of the file and stopped at the
+    first ``max_entries`` matches, which meant that once a tenant had more than
+    that many entries the endpoint returned the oldest records in the log and
+    never surfaced recent activity — the wrong end of the file for a compliance
+    query, and a scan whose cost grew with total history.
+
     `tier_filter` filters on `user_tier` (standard|premium|esg|batch).
     `tenant_filter` filters on `tenant_id` — the multi-tenant isolation key.
     """
-    if not LOG_FILE.exists():
+    if not LOG_FILE.exists() or max_entries <= 0:
         return []
     results: list[dict[str, Any]] = []
     try:
-        with LOG_FILE.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                # Timestamp filter
-                ts_str = entry.get("timestamp", "")
-                if from_ts is not None or to_ts is not None:
-                    try:
-                        from datetime import datetime, timezone
-                        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
-                        if from_ts is not None and ts < from_ts:
-                            continue
-                        if to_ts is not None and ts > to_ts:
-                            continue
-                    except Exception:
-                        pass
-
-                # Model filter
-                if model_filter and entry.get("selected_model") != model_filter:
-                    continue
-
-                # Tier filter (user_tier — standard|premium|esg|batch)
-                if tier_filter and entry.get("user_tier") != tier_filter:
-                    continue
-
-                # Tenant filter (tenant_id — multi-tenant isolation)
-                if tenant_filter:
-                    entry_tenant = entry.get("tenant_id") or DEFAULT_TENANT_ID
-                    if entry_tenant != tenant_filter:
-                        continue
-
-                # Carbon threshold filter
-                if min_carbon_g is not None:
-                    entry_carbon = safe_float(entry.get("estimated_carbon_g") or
-                                             (entry.get("selected_candidate") or {}).get("estimated_carbon_g"), 0.0)
-                    if entry_carbon < min_carbon_g:
-                        continue
-
-                results.append(entry)
-                if len(results) >= max_entries:
-                    break
+        for line in _iter_log_lines_reverse(LOG_FILE):
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue          # a torn or hand-edited line must not be fatal
+            if not isinstance(entry, dict):
+                continue
+            if not _audit_entry_matches(
+                entry, from_ts, to_ts, model_filter,
+                tier_filter, tenant_filter, min_carbon_g,
+            ):
+                continue
+            results.append(entry)
+            if len(results) >= max_entries:
+                break
     except OSError as exc:
         logger.error("Audit log read failed: %s", exc)
     return results
