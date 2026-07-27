@@ -133,7 +133,12 @@ class _TierState:
     )
 
     def __init__(self, weights: dict[str, float]):
-        self.weights: dict[str, float] = dict(weights)
+        # Project on the way in, not only after an update. State written before
+        # the floor bug in _project_simplex was fixed can hold a sub-floor
+        # carbon weight; without this, such a deployment keeps routing on it
+        # until some later update happens to lift it back. Projecting here
+        # covers both fresh construction and from_dict(), so a restart heals it.
+        self.weights: dict[str, float] = _project_simplex(dict(weights))
         self.episode_count: int = 0
         self.baseline_ema: float = 0.5       # initialise at midpoint
         self.reward_history: deque[float] = deque(maxlen=MAX_REWARD_HISTORY)
@@ -629,26 +634,54 @@ def _compute_policy_gradient(
 
 def _project_simplex(weights: dict[str, float], w_min: float = W_MIN) -> dict[str, float]:
     """
-    Project weights onto the probability simplex with a floor constraint w_i ≥ w_min.
-    1. Clip all below w_min to w_min.
-    2. Clip all above 1 to bound.
-    3. Renormalise to sum = 1.
-    Repeats until stable (handles the constraint propagation).
+    Project weights onto the probability simplex under a floor: sum == 1 and
+    every w_i >= w_min.
+
+    Both constraints are satisfied exactly, in one pass: reserve ``w_min`` for
+    each key, then share the remaining mass out in proportion to how far each
+    weight sits above the floor.
+
+        free   = 1 - w_min * n
+        w_i    = w_min + free * excess_i / sum(excess),  excess_i = max(0, w_i - w_min)
+
+    Properties this gives us, all relied on elsewhere:
+      * sum == 1 exactly (n * w_min + free);
+      * w_i >= w_min, and w_i <= 1 - (n-1) * w_min <= 1;
+      * idempotent — re-projecting a valid distribution returns it unchanged,
+        since its excesses already sum to ``free``;
+      * order-preserving among weights above the floor, so the projection
+        enforces constraints without rewriting what the policy learned.
+
+    The previous implementation clipped to ``[w_min, 1]`` and then renormalised
+    inside a loop. The renormalise divides by a total > 1, which pushes clipped
+    weights back *below* the floor, and the loop's exit test (``sum == 1``) is
+    true immediately after every renormalise — so it never iterated and the
+    floor was silently not enforced. Measured before this fix: a lopsided update
+    drove ``carbon`` to 0.0164 against a floor of 0.05, and that was persisted to
+    rl_state.json. ``W_MIN`` exists precisely so online learning cannot squeeze a
+    CSS dimension out, and carbon is the dimension the system exists to optimise.
     """
     keys = list(_COEFFICIENT_KEYS)
-    w = {k: float(weights.get(k, 1.0 / len(keys))) for k in keys}
+    n = len(keys)
+    if n == 0:
+        return {}
 
-    for _ in range(10):    # converges in ≤ 3 iterations in practice
-        # Clip to [w_min, 1]
-        w = {k: max(w_min, min(1.0, v)) for k, v in w.items()}
-        total = sum(w.values())
-        if total <= 0:
-            total = 1.0
-        w = {k: v / total for k, v in w.items()}
-        if abs(sum(w.values()) - 1.0) < 1e-9:
-            break
+    # An infeasible floor (w_min * n >= 1) leaves no mass to distribute; the
+    # only distribution satisfying it is uniform.
+    if w_min * n >= 1.0:
+        return {k: 1.0 / n for k in keys}
 
-    return w
+    w = {k: float(weights.get(k, 1.0 / n)) for k in keys}
+    free = 1.0 - w_min * n
+    excess = {k: max(0.0, v - w_min) for k, v in w.items()}
+    total_excess = sum(excess.values())
+
+    # Nothing above the floor (all-zero, all-negative, or all at the floor):
+    # no basis to prefer one dimension, so split evenly.
+    if total_excess <= 0.0:
+        return {k: 1.0 / n for k in keys}
+
+    return {k: w_min + free * (excess[k] / total_excess) for k in keys}
 
 
 # ── Dirichlet noise ───────────────────────────────────────────────────────────

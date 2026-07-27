@@ -153,6 +153,13 @@ class ModelZooService:
             he_effective = he * (1.0 - all_to_all_ratio)
         else:
             he_effective = he
+        # Same numerical guard as compute_request_carbon: he_effective is a
+        # divisor below, and an entry with hardware_efficiency 0 or an
+        # all_to_all_overhead_ratio of 1.0 would make it zero. No shipped model
+        # does that today, but register_model() and the model-zoo auto-updater
+        # can add entries that would, and the two functions must not disagree
+        # about whether such an entry is priceable.
+        he_effective = max(he_effective, 0.05)
 
         # TDP (peak power in Watts) and PUE
         tdp_w = float(model.get("power_tdp_w", 100.0))
