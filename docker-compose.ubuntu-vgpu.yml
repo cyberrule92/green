@@ -14,6 +14,7 @@ services:
       - HF_TOKEN=${HF_TOKEN:-}
     volumes:
       - ./data/hf-cache:/root/.cache/huggingface
+      - ./scripts/vllm_healthcheck.py:/healthcheck.py:ro
     ports:
       - "8001:8001"
     deploy:
@@ -25,9 +26,14 @@ services:
               capabilities: [gpu]
     shm_size: "4gb"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:8001/health"]
-      interval: 20s
-      timeout: 5s
+      # Generates one token. `/health` returns 200 from a wedged engine —
+      # that state went undetected for 21 hours on 2026-07-29 and took the
+      # whole API down with it. See scripts/vllm_healthcheck.py.
+      test: ["CMD", "python3", "/healthcheck.py", "8001"]
+      # Slower than the old 20s poll because this one costs a token.
+      interval: 60s
+      # Above the script's own 5s + 25s worst case.
+      timeout: 35s
       start_period: 60s
       retries: 5
     restart: unless-stopped
@@ -57,6 +63,7 @@ services:
       - HF_TOKEN=${HF_TOKEN:-}
     volumes:
       - ./data/hf-cache:/root/.cache/huggingface
+      - ./scripts/vllm_healthcheck.py:/healthcheck.py:ro
     ports:
       - "8002:8002"
     deploy:
@@ -68,9 +75,14 @@ services:
               capabilities: [gpu]
     shm_size: "4gb"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:8002/health"]
-      interval: 20s
-      timeout: 5s
+      # Generates one token. `/health` returns 200 from a wedged engine —
+      # that state went undetected for 21 hours on 2026-07-29 and took the
+      # whole API down with it. See scripts/vllm_healthcheck.py.
+      test: ["CMD", "python3", "/healthcheck.py", "8002"]
+      # Slower than the old 20s poll because this one costs a token.
+      interval: 60s
+      # Above the script's own 5s + 25s worst case.
+      timeout: 35s
       start_period: 60s
       retries: 5
     restart: unless-stopped
@@ -98,6 +110,7 @@ services:
       - HF_TOKEN=${HF_TOKEN:-}
     volumes:
       - ./data/hf-cache:/root/.cache/huggingface
+      - ./scripts/vllm_healthcheck.py:/healthcheck.py:ro
     ports:
       - "8008:8008"
     deploy:
@@ -109,9 +122,14 @@ services:
               capabilities: [gpu]
     shm_size: "2gb"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:8008/health"]
-      interval: 20s
-      timeout: 5s
+      # Generates one token. `/health` returns 200 from a wedged engine —
+      # that state went undetected for 21 hours on 2026-07-29 and took the
+      # whole API down with it. See scripts/vllm_healthcheck.py.
+      test: ["CMD", "python3", "/healthcheck.py", "8008"]
+      # Slower than the old 20s poll because this one costs a token.
+      interval: 60s
+      # Above the script's own 5s + 25s worst case.
+      timeout: 35s
       start_period: 300s
       retries: 10
     restart: unless-stopped
@@ -139,6 +157,7 @@ services:
       - HF_TOKEN=${HF_TOKEN:-}
     volumes:
       - ./data/hf-cache:/root/.cache/huggingface
+      - ./scripts/vllm_healthcheck.py:/healthcheck.py:ro
     ports:
       - "8003:8003"
     deploy:
@@ -150,9 +169,14 @@ services:
               capabilities: [gpu]
     shm_size: "8gb"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:8003/health"]
-      interval: 20s
-      timeout: 5s
+      # Generates one token. `/health` returns 200 from a wedged engine —
+      # that state went undetected for 21 hours on 2026-07-29 and took the
+      # whole API down with it. See scripts/vllm_healthcheck.py.
+      test: ["CMD", "python3", "/healthcheck.py", "8003"]
+      # Slower than the old 20s poll because this one costs a token.
+      interval: 60s
+      # Above the script's own 5s + 25s worst case.
+      timeout: 35s
       start_period: 120s
       retries: 5
     restart: unless-stopped
@@ -170,6 +194,7 @@ services:
       - HF_TOKEN=${HF_TOKEN:-}
     volumes:
       - ./data/hf-cache:/root/.cache/huggingface
+      - ./scripts/vllm_healthcheck.py:/healthcheck.py:ro
     ports:
       - "8004:8004"
     deploy:
@@ -181,9 +206,14 @@ services:
               capabilities: [gpu]
     shm_size: "4gb"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:8004/health"]
-      interval: 20s
-      timeout: 5s
+      # Generates one token. `/health` returns 200 from a wedged engine —
+      # that state went undetected for 21 hours on 2026-07-29 and took the
+      # whole API down with it. See scripts/vllm_healthcheck.py.
+      test: ["CMD", "python3", "/healthcheck.py", "8004"]
+      # Slower than the old 20s poll because this one costs a token.
+      interval: 60s
+      # Above the script's own 5s + 25s worst case.
+      timeout: 35s
       start_period: 60s
       retries: 5
     restart: unless-stopped
@@ -208,6 +238,7 @@ services:
       - HF_TOKEN=${HF_TOKEN:-}
     volumes:
       - ./data/hf-cache:/root/.cache/huggingface
+      - ./scripts/vllm_healthcheck.py:/healthcheck.py:ro
     ports:
       - "8005:8005"
     deploy:
@@ -219,9 +250,14 @@ services:
               capabilities: [gpu]
     shm_size: "4gb"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:8005/health"]
-      interval: 20s
-      timeout: 5s
+      # Generates one token. `/health` returns 200 from a wedged engine —
+      # that state went undetected for 21 hours on 2026-07-29 and took the
+      # whole API down with it. See scripts/vllm_healthcheck.py.
+      test: ["CMD", "python3", "/healthcheck.py", "8005"]
+      # Slower than the old 20s poll because this one costs a token.
+      interval: 60s
+      # Above the script's own 5s + 25s worst case.
+      timeout: 35s
       start_period: 60s
       retries: 5
     restart: unless-stopped
@@ -246,6 +282,7 @@ services:
       - HF_TOKEN=${HF_TOKEN:-}
     volumes:
       - ./data/hf-cache:/root/.cache/huggingface
+      - ./scripts/vllm_healthcheck.py:/healthcheck.py:ro
     ports:
       - "8006:8006"
     deploy:
@@ -257,9 +294,14 @@ services:
               capabilities: [gpu]
     shm_size: "4gb"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:8006/health"]
-      interval: 20s
-      timeout: 5s
+      # Generates one token. `/health` returns 200 from a wedged engine —
+      # that state went undetected for 21 hours on 2026-07-29 and took the
+      # whole API down with it. See scripts/vllm_healthcheck.py.
+      test: ["CMD", "python3", "/healthcheck.py", "8006"]
+      # Slower than the old 20s poll because this one costs a token.
+      interval: 60s
+      # Above the script's own 5s + 25s worst case.
+      timeout: 35s
       start_period: 60s
       retries: 5
     restart: unless-stopped
@@ -292,6 +334,7 @@ services:
       - HF_TOKEN=${HF_TOKEN:-}
     volumes:
       - ./data/hf-cache:/root/.cache/huggingface
+      - ./scripts/vllm_healthcheck.py:/healthcheck.py:ro
     ports:
       - "8009:8009"
     deploy:
@@ -303,9 +346,14 @@ services:
               capabilities: [gpu]
     shm_size: "4gb"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:8009/health"]
-      interval: 20s
-      timeout: 5s
+      # Generates one token. `/health` returns 200 from a wedged engine —
+      # that state went undetected for 21 hours on 2026-07-29 and took the
+      # whole API down with it. See scripts/vllm_healthcheck.py.
+      test: ["CMD", "python3", "/healthcheck.py", "8009"]
+      # Slower than the old 20s poll because this one costs a token.
+      interval: 60s
+      # Above the script's own 5s + 25s worst case.
+      timeout: 35s
       # First boot downloads ~5.5 GB of weights.
       start_period: 600s
       retries: 5
@@ -330,15 +378,21 @@ services:
       - VLLM_CPU_KVCACHE_SPACE=${VLLM_CPU_KVCACHE_SPACE:-8}
     volumes:
       - ./data/hf-cache:/root/.cache/huggingface
+      - ./scripts/vllm_healthcheck.py:/healthcheck.py:ro
     ports:
       - "8007:8007"
     cpus: "8.0"
     mem_limit: "32g"
     shm_size: "4gb"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:8007/health"]
-      interval: 30s
-      timeout: 10s
+      # Generates one token. `/health` returns 200 from a wedged engine —
+      # that state went undetected for 21 hours on 2026-07-29 and took the
+      # whole API down with it. See scripts/vllm_healthcheck.py.
+      test: ["CMD", "python3", "/healthcheck.py", "8007"]
+      # Slower than the old 20s poll because this one costs a token.
+      interval: 60s
+      # Above the script's own 5s + 25s worst case.
+      timeout: 35s
       start_period: 240s
       retries: 6
     restart: unless-stopped
@@ -348,7 +402,21 @@ services:
       context: .
       dockerfile: Dockerfile
     command: ["python", "host_metrics_service.py"]
+    # GPU access AND privileged are both required to read memory on a MIG board:
+    # with only --gpus, nvidia-smi returns "[Insufficient Permissions]" for every
+    # memory column. This is the sole in-container source of GPU occupancy on
+    # this host, and model onboarding refuses to size a model without it.
+    # Scoped to this sidecar deliberately — the API keeps ordinary privileges.
+    privileged: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     environment:
+      NVIDIA_DRIVER_CAPABILITIES: all
       CACHE_DURATION: 15
       SYSTEM_SCRIPT: /app/system_metrics.sh
       # Set to 1 ONLY if no GPU is present (avoids nvidia-smi errors)
