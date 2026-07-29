@@ -42,7 +42,10 @@
         "computed_at": "2026-04-15",
         "op_carbon_per_1k_tokens_g": 0.0012,
         "emb_carbon_per_1k_tokens_g": 8e-05
-      }
+      },
+      "max_output_tokens": 256,
+      "expected_output_tokens": 108,
+      "expected_output_tokens_basis": "measured:len-aware-01"
     },
     {
       "id": "local-vgpu-medium",
@@ -84,7 +87,10 @@
         "computed_at": "2026-04-15",
         "op_carbon_per_1k_tokens_g": 0.0038,
         "emb_carbon_per_1k_tokens_g": 8e-05
-      }
+      },
+      "max_output_tokens": 384,
+      "expected_output_tokens": 108,
+      "expected_output_tokens_basis": "measured:len-aware-01"
     },
     {
       "id": "local-vgpu-full",
@@ -125,7 +131,10 @@
         "computed_at": "2026-04-15",
         "op_carbon_per_1k_tokens_g": 0.0073,
         "emb_carbon_per_1k_tokens_g": 8e-05
-      }
+      },
+      "max_output_tokens": 1024,
+      "expected_output_tokens": 94,
+      "expected_output_tokens_basis": "measured:len-aware-01"
     },
     {
       "id": "local-vgpu-moe",
@@ -178,7 +187,8 @@
         "total_experts": 8,
         "healthy_experts": 8,
         "last_health_check": null
-      }
+      },
+      "max_output_tokens": 1024
     },
     {
       "id": "local-vgpu-stem-math",
@@ -231,7 +241,10 @@
         "op_carbon_per_1k_tokens_g": 0.0073,
         "emb_carbon_per_1k_tokens_g": 0.0001
       },
-      "bench_disabled_reason": "no live backend on this host"
+      "bench_disabled_reason": "no live backend on this host",
+      "max_output_tokens": 768,
+      "expected_output_tokens": 242,
+      "expected_output_tokens_basis": "estimated_from_sibling"
     },
     {
       "id": "local-vgpu-stem-science",
@@ -284,7 +297,10 @@
         "op_carbon_per_1k_tokens_g": 0.0073,
         "emb_carbon_per_1k_tokens_g": 0.0001
       },
-      "bench_disabled_reason": "no live backend on this host"
+      "bench_disabled_reason": "no live backend on this host",
+      "max_output_tokens": 768,
+      "expected_output_tokens": 242,
+      "expected_output_tokens_basis": "estimated_from_sibling"
     },
     {
       "id": "local-vgpu-stem-coding",
@@ -335,7 +351,10 @@
         "computed_at": "2026-04-30",
         "op_carbon_per_1k_tokens_g": 0.0068,
         "emb_carbon_per_1k_tokens_g": 0.0001
-      }
+      },
+      "max_output_tokens": 1024,
+      "expected_output_tokens": 242,
+      "expected_output_tokens_basis": "measured:len-aware-01"
     },
     {
       "id": "local-vgpu-coder-7b",
@@ -386,7 +405,8 @@
         "computed_at": "2026-07-13",
         "op_carbon_per_1k_tokens_g": 0.024,
         "emb_carbon_per_1k_tokens_g": 0.0004
-      }
+      },
+      "max_output_tokens": 1536
     },
     {
       "id": "local-cpu-fallback",
@@ -427,7 +447,10 @@
         "op_carbon_per_1k_tokens_g": 0.0006,
         "emb_carbon_per_1k_tokens_g": 1.8e-05
       },
-      "bench_disabled_reason": "resolves to the same vllm-medium container as local-vgpu-small"
+      "bench_disabled_reason": "resolves to the same vllm-medium container as local-vgpu-small",
+      "max_output_tokens": 256,
+      "expected_output_tokens": 108,
+      "expected_output_tokens_basis": "measured:len-aware-01"
     },
     {
       "id": "local-cpu-llama2-7b-fallback",
@@ -471,8 +494,11 @@
         "op_carbon_per_1k_tokens_g": 0.0072,
         "emb_carbon_per_1k_tokens_g": 1.8e-05
       },
-      "notes": "Paper \u00a74.3 names Llama2-7B as the always-available fallback model. Routed only when Decision Engine fails or all primary candidates are unavailable; high latency keeps CSS rank low for normal traffic.",
-      "bench_disabled_reason": "no live backend on this host"
+      "notes": "Paper §4.3 names Llama2-7B as the always-available fallback model. Routed only when Decision Engine fails or all primary candidates are unavailable; high latency keeps CSS rank low for normal traffic.",
+      "bench_disabled_reason": "no live backend on this host",
+      "max_output_tokens": 1024,
+      "expected_output_tokens": 94,
+      "expected_output_tokens_basis": "measured:len-aware-01"
     },
     {
       "id": "us-west-gpu-medium",
@@ -513,7 +539,8 @@
         "computed_at": "2026-04-15",
         "op_carbon_per_1k_tokens_g": 0.0028,
         "emb_carbon_per_1k_tokens_g": 1.2e-05
-      }
+      },
+      "max_output_tokens": 384
     },
     {
       "id": "eu-gpu-medium",
@@ -554,7 +581,8 @@
         "computed_at": "2026-04-15",
         "op_carbon_per_1k_tokens_g": 0.00195,
         "emb_carbon_per_1k_tokens_g": 1.2e-05
-      }
+      },
+      "max_output_tokens": 384
     },
     {
       "region": "local",
