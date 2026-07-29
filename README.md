@@ -8,6 +8,7 @@ This project now implements the architecture from the attached Adaptive Green AI
 - HPE-themed frontend with an embedded Advanced RAG architecture view inspired by the uploaded diagram
 - Ubuntu vGPU deployment path around Triton, the API, the metrics sidecar, and the frontend
 - Optional HTTPS edge for real browser-safe production access behind a DNS hostname
+- Model onboarding: browse Hugging Face, size a quantization plan against the VRAM actually free, download, serve and register new routing candidates — which stay unavailable to the router until measured
 
 ## Main services
 
@@ -15,6 +16,7 @@ This project now implements the architecture from the attached Adaptive Green AI
 - `advanced_rag.py`: document indexing, hybrid retrieval, reranking, and context fusion
 - `routing_policies.py`: tier policies, candidate ranking, and EcoServe-style routing signals
 - `conversation_store.py`: persistent conversation storage in SQLite
+- `model_onboarding.py`: Hugging Face browse/quantize/serve/register pipeline behind `/api/models`
 - `frontend/`: HPE chat UI with architecture and knowledge-base panels
 
 ## Ubuntu vGPU deployment

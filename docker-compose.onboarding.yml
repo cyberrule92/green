@@ -1,0 +1,57 @@
+# Opt-in overlay: dynamic serving for onboarded models.
+#
+# Launching a vLLM container for a model onboarded through /api/models requires
+# the API container to talk to the Docker Engine API. This overlay bind-mounts
+# the socket to do that.
+#
+# Understand what it grants before enabling it. The Docker socket is
+# root-equivalent control of the host: anything able to reach it can start a
+# privileged container and mount the host filesystem. That is why it is a
+# separate file rather than a line in the default stack, and why
+# MODEL_ONBOARD_ENABLED defaults to false as a second, independent gate.
+#
+# Without this overlay onboarding still works — it browses, sizes, downloads and
+# registers. Only the serve step reports itself unavailable, with the reason
+# surfaced in /api/models/capability and on the Models tab. An operator can
+# still serve an onboarded model by adding a normal service to the compose file
+# by hand, which keeps container lifecycle in the operator's control.
+#
+# Usage:
+#   docker compose -f docker-compose.ubuntu-vgpu.yml \
+#                  -f docker-compose.onboarding.yml \
+#                  --env-file .env up --build -d
+
+# Note on GPU visibility: this overlay deliberately does NOT give the API
+# container GPU device access. On a MIG-partitioned board (this deployment is an
+# H100L-2-24C) in-container memory queries return "[Insufficient Permissions]"
+# even with the MIG UUID exposed, so it would add privilege without adding a
+# reading. Occupancy comes from the host metrics sidecar instead — run it on the
+# host with DISABLE_GPU_METRICS=0, or the planner refuses to size and says so.
+
+services:
+  api:
+    volumes:
+      # Read-write is required: the API creates, starts and removes containers.
+      - /var/run/docker.sock:/var/run/docker.sock
+    # The image runs as uid 1000 (appuser) while the socket is root:docker 0660,
+    # so without the docker group the mount is present but every call is denied —
+    # which surfaces as "socket present but not responding". Set DOCKER_GID to the
+    # host's docker group id: stat -c '%g' /var/run/docker.sock
+    group_add:
+      - "${DOCKER_GID:-999}"
+    environment:
+      MODEL_ONBOARD_ENABLED: ${MODEL_ONBOARD_ENABLED:-true}
+      DOCKER_SOCKET: ${DOCKER_SOCKET:-/var/run/docker.sock}
+      MODEL_SERVE_IMAGE: ${MODEL_SERVE_IMAGE:-vllm/vllm-openai:latest}
+      # Must match the network the API and the vLLM containers actually share,
+      # or a served model starts but nothing can route to it.
+      MODEL_SERVE_NETWORK: ${MODEL_SERVE_NETWORK:-green_default}
+      MODEL_SERVE_PORT_BASE: ${MODEL_SERVE_PORT_BASE:-8010}
+      # Host path, not a container path: it is passed to the Docker Engine API
+      # as the source of a bind mount for the containers the API creates, so the
+      # daemon resolves it on the host.
+      HF_CACHE_HOST_PATH: ${HF_CACHE_HOST_PATH:-/opt/green/data/hf-cache}
+      MODEL_ONBOARD_VRAM_RESERVE_MB: ${MODEL_ONBOARD_VRAM_RESERVE_MB:-1024}
+      MODEL_ONBOARD_DISK_RESERVE_GB: ${MODEL_ONBOARD_DISK_RESERVE_GB:-20}
+      MODEL_QUANT_IMAGE: ${MODEL_QUANT_IMAGE:-}
+      MODEL_QUANT_COMMAND: ${MODEL_QUANT_COMMAND:-}

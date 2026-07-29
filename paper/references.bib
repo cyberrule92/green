@@ -1,0 +1,112 @@
+% =============================================================================
+% References for Adaptive Green AI preprint.
+% Citations verified 2026-07-15: EcoServe (arXiv:2502.05043, 2025),
+% RouteLLM (ICLR 2025, arXiv:2406.18665), LLMCarbon (ICLR 2024), Carbon Explorer
+% (ASPLOS 2023), Switch Transformers (JMLR 2022). NVIDIA LLM Router and the
+% GSF Carbon Aware SDK are cited as their canonical project/blueprint URLs.
+% =============================================================================
+
+@misc{nvidia-llm-router,
+  author       = {{NVIDIA}},
+  title        = {{NVIDIA AI Blueprint: LLM Router}},
+  year         = {2024},
+  howpublished = {\url{https://github.com/NVIDIA-AI-Blueprints/llm-router}}
+}
+
+@inproceedings{llmcarbon,
+  author    = {Faiz, Ahmad and Kaneda, Sotaro and Wang, Ruhan and Osi, Rita
+               and Sharma, Prateek and Chen, Fan and Jiang, Lei},
+  title     = {{LLMCarbon}: Modeling the End-to-End Carbon Footprint of Large
+               Language Models},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2024},
+  eprint    = {2309.14393},
+  archivePrefix = {arXiv}
+}
+
+@misc{ecoserve,
+  author       = {Li, Yueying and Hu, Zhanqiu and Choukse, Esha and
+                  Fonseca, Rodrigo and Suh, G. Edward and Gupta, Udit},
+  title        = {{EcoServe}: Designing Carbon-Aware {AI} Inference Systems},
+  year         = {2025},
+  eprint       = {2502.05043},
+  archivePrefix = {arXiv},
+  primaryClass = {cs.DC},
+  howpublished = {\url{https://arxiv.org/abs/2502.05043}}
+}
+
+@inproceedings{carbon-explorer,
+  author    = {Acun, Bilge and Lee, Benjamin and Kazhamiaka, Fiodar and
+               Maeng, Kiwan and Gupta, Udit and Chakkaravarthy, Manoj and
+               Brooks, David and Wu, Carole-Jean},
+  title     = {Carbon Explorer: A Holistic Framework for Designing Carbon Aware
+               Datacenters},
+  booktitle = {Proceedings of the 28th ACM International Conference on
+               Architectural Support for Programming Languages and Operating
+               Systems (ASPLOS)},
+  year      = {2023}
+}
+
+@article{mlco2,
+  author  = {Lacoste, Alexandre and Luccioni, Alexandra and Schmidt, Victor
+             and Dandres, Thomas},
+  title   = {Quantifying the Carbon Emissions of Machine Learning},
+  journal = {arXiv preprint arXiv:1910.09700},
+  year    = {2019}
+}
+
+@article{green-ai,
+  author  = {Schwartz, Roy and Dodge, Jesse and Smith, Noah A. and Etzioni, Oren},
+  title   = {Green {AI}},
+  journal = {Communications of the ACM},
+  volume  = {63},
+  number  = {12},
+  year    = {2020}
+}
+
+@inproceedings{routellm,
+  author    = {Ong, Isaac and Almahairi, Amjad and Wu, Vincent and
+               Chiang, Wei-Lin and Wu, Tianhao and Gonzalez, Joseph E. and
+               Kadous, M. Waleed and Stoica, Ion},
+  title     = {{RouteLLM}: Learning to Route {LLMs} with Preference Data},
+  booktitle = {International Conference on Learning Representations (ICLR)},
+  year      = {2025},
+  eprint    = {2406.18665},
+  archivePrefix = {arXiv}
+}
+
+@inproceedings{wait-awhile,
+  author    = {Wiesner, Philipp and Behnke, Ilja and Scheinert, Dominik and
+               Gontarska, Kordian and Thamsen, Lauritz},
+  title     = {Let's Wait Awhile: How Temporal Workload Shifting Can Reduce
+               Carbon Emissions in the Cloud},
+  booktitle = {ACM/IFIP Middleware},
+  year      = {2021}
+}
+
+@misc{carbon-aware-k8s,
+  author       = {{Green Software Foundation}},
+  title        = {Carbon Aware {SDK} / {Kubernetes} Scheduler},
+  year         = {2023},
+  howpublished = {\url{https://github.com/Green-Software-Foundation/carbon-aware-sdk}}
+}
+
+@inproceedings{vllm,
+  author    = {Kwon, Woosuk and Li, Zhuohan and Zhuang, Siyuan and
+               Sheng, Ying and Zheng, Lianmin and Yu, Cody Hao and
+               Gonzalez, Joseph E. and Zhang, Hao and Stoica, Ion},
+  title     = {Efficient Memory Management for Large Language Model Serving
+               with {PagedAttention}},
+  booktitle = {ACM SOSP},
+  year      = {2023}
+}
+
+@article{moe,
+  author  = {Fedus, William and Zoph, Barret and Shazeer, Noam},
+  title   = {Switch Transformers: Scaling to Trillion Parameter Models with
+             Simple and Efficient Sparsity},
+  journal = {Journal of Machine Learning Research},
+  volume  = {23},
+  number  = {120},
+  year    = {2022}
+}

@@ -126,17 +126,6 @@ from model_zoo import ModelZooService  # noqa: E402
 
 _ZOO_SERVICE = ModelZooService(zoo_path=ROOT / "config" / "model_zoo.json")
 
-# Workflow figures, read from the registry and the seeded gallery rather than
-# written into the prose, so a new node type or template cannot leave this
-# document quoting a number the product has moved past.
-import workflows as _WF_MOD              # noqa: E402
-import workflow_templates as _WT_MOD     # noqa: E402
-
-_WF_NODE_TYPES = _WF_MOD.NODE_TYPES
-_WF_TEMPLATE_COUNT = len(_WT_MOD.TEMPLATES)
-_WF_INDUSTRY_COUNT = len({t["industry"] for t in _WT_MOD.TEMPLATES})
-
-
 def _request_duration_s(m: dict) -> float:
     """Per-request wall-clock the charts price against: the candidate's p50."""
     return m.get("latency_ms_p50", 200) / 1000.0
@@ -1268,8 +1257,6 @@ def build():
          cell("Action-based rails, no external LLM: ~30 input patterns (jailbreak, CBRN, self-harm), a non-blocking sensitive rail, and an output rail for credential/PII leakage. Both phases land in the audit trail.")],
         [cell("<b>coding_agent.py</b>"),
          cell("LangGraph state machine; frozen validated spec; verifier-gated escalation; per-task gCO₂ budget; sandboxed workspace with traversal-checked writes; AGENT_LLM_TIMEOUT_S = 180 s (the 45 s chat timeout throws away answers the GPU has already paid for).")],
-        [cell("<b>workflows.py</b>"),
-         cell("Dependency-free DAG engine; heavy capabilities injected as callables so the same graph runs against real or stub services. Parallel supersteps under WF_MAX_PARALLEL, per-node retries/timeout/on_error, depth-guarded sub-workflows with map fan-out, approval nodes that snapshot JSON-serialisable state to pause and resume, cooperative cancellation between supersteps, and $vars shared by reference across the run. Credentials are encrypted at rest and resolved only with the running workflow's tenant — the HTTP node's URL is author-controlled, so an unscoped lookup would exfiltrate another tenant's token.")],
         [cell("<b>conversation_store.py</b>"),
          cell("SQLite in WAL mode. metadata_json carries the entire decision blob, so any message in the UI can be replayed from a single row.")],
     ], [45 * mm, 125 * mm]))   # 45mm: quality_latency_estimator.py needs 110pt + padding
@@ -1327,8 +1314,6 @@ def build():
         [cell("<b>Observability</b>"), cell("KPIs, period-over-period deltas, SLO + error budget, latency heatmap, per-model rollup, anomaly z-scores, trace explorer with CSV export."), cell("Live")],
         [cell("<b>Signed audit trail</b>"), cell("HMAC-SHA256 per decision; the single source of truth behind every dashboard."), cell("Live")],
         [cell("<b>Feedback capture</b>"), cell("Thumbs up/down per assistant message → SQLite → JSONL export, seeding offline LoRA fine-tuning."), cell("Live")],
-        [cell("<b>Workflow orchestration</b>"), cell(f"Visual node-based automation (n8n/Make style) with LangGraph-depth execution: {len(_WF_NODE_TYPES)} node types, parallel supersteps, sub-workflows, human approval, cron and carbon-window triggers, failure handlers, cancellation, and a per-run gCO₂ receipt. Every AI node is CSS-routed."), cell("Live")],
-        [cell("<b>Workflow template gallery</b>"), cell(f"{_WF_TEMPLATE_COUNT} runnable, validated templates across {_WF_INDUSTRY_COUNT} industries; instantiate copies a graph into a new disabled workflow for review before it can fire."), cell("Live")],
         [cell("<b>CSRD reporting</b>"), cell("Period energy/carbon rollup with market-based renewable accounting; CSV export."), cell("Live")],
     ], [40 * mm, 106 * mm, 24 * mm]))
 

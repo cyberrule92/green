@@ -55,13 +55,10 @@ except ModuleNotFoundError:
 from advanced_rag import AdvancedRAGService
 from conversation_store import ConversationStore
 from deferred_queue import get_deferred_queue
-from workflows import (
-    WorkflowStore, WorkflowEngine, WorkflowServices,
-    validate_graph, node_types_public, cron_matches,
-    secret_encrypt, secret_decrypt,
-)
+from secret_box import secret_decrypt, secret_encrypt
 from model_zoo import get_model_zoo
 from model_zoo_updater import get_zoo_updater
+from model_onboarding import HFError, ModelOnboardingService
 from monitoring_layer import (
     fetch_all_zone_signals,
     fetch_grid_signal,
@@ -239,17 +236,17 @@ def _resolve_audit_hmac_key() -> bytes:
 AUDIT_HMAC_KEY = _resolve_audit_hmac_key()
 
 
-# Encryption key for stored workflow HTTP credentials. Prefer a dedicated
-# WF_SECRET_KEY; otherwise reuse the audit key so credentials are still
-# encrypted at rest. With neither set (dev), the audit key is ephemeral per
-# process, so stored credentials will not decrypt after a restart -- set
-# WF_SECRET_KEY in production for durable credentials.
-def _resolve_wf_secret_key() -> bytes:
-    raw = os.getenv("WF_SECRET_KEY", "").strip()
+# Encryption key for secrets at rest — currently HF_TOKEN_ENC. Prefer a
+# dedicated SECRET_KEY; WF_SECRET_KEY is still read so deployments that set it
+# for the old workflow credentials keep working. With neither set (dev), the
+# audit key is ephemeral per process, so encrypted values will not decrypt after
+# a restart -- set SECRET_KEY in production.
+def _resolve_secret_key() -> bytes:
+    raw = os.getenv("SECRET_KEY", "").strip() or os.getenv("WF_SECRET_KEY", "").strip()
     return raw.encode("utf-8") if raw else AUDIT_HMAC_KEY
 
 
-WF_SECRET_KEY = _resolve_wf_secret_key()
+SECRET_KEY = _resolve_secret_key()
 
 # Multi-region: fetch zone signals at startup + cache
 MULTI_REGION_ENABLED = os.getenv("MULTI_REGION_ENABLED", "false").lower() in {"1", "true", "yes"}
@@ -387,7 +384,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 store = ConversationStore(STORE_PATH)
-workflow_store = WorkflowStore(STORE_PATH)
 rag_service = AdvancedRAGService(
     RAG_STORE_PATH,
     chunk_size=int(os.getenv("RAG_CHUNK_SIZE", "900")),
@@ -463,20 +459,23 @@ async def _start_background_workers() -> None:
     # Model-zoo auto-updater. Off by default; only starts when
     # MODEL_ZOO_UPDATE_ENABLED=true and MODEL_ZOO_UPDATE_SOURCE is set.
     get_zoo_updater().start()
-    # Workflow trigger scheduler (cron + carbon-window). On by default.
-    global _wf_sched_task
-    if WF_SCHEDULER_ENABLED and _wf_sched_task is None:
-        _wf_sched_task = asyncio.create_task(_workflow_scheduler_loop())
+    # Re-export endpoint env vars for previously onboarded models. resolve_vllm_endpoint
+    # reads them with os.getenv at lookup time, and an in-process env var does not
+    # survive a restart — without this an onboarded model stays registered but
+    # unreachable, which is the worst of both states.
+    if os.getenv("MODEL_ONBOARD_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}:
+        try:
+            restored = _get_onboarding_service().restore_endpoints()
+            if restored:
+                logger.info("Restored onboarded model endpoints: %s", ", ".join(restored))
+        except Exception as exc:  # noqa: BLE001 - never block startup on this
+            logger.warning("Could not restore onboarded model endpoints: %s", exc)
 
 
 @app.on_event("shutdown")
 async def _stop_background_workers() -> None:
     get_model_zoo().stop_health_reconciler()
     get_zoo_updater().stop()
-    global _wf_sched_task
-    if _wf_sched_task is not None:
-        _wf_sched_task.cancel()
-        _wf_sched_task = None
 
 
 allowed_origins = [
@@ -2337,7 +2336,7 @@ def run_vllm_inference(
     # Per-variant verbosity cap (model_zoo `max_output_tokens`). Carbon here is
     # power x duration and duration scales with emitted tokens, so an unbounded
     # output budget on a weak, rambling model is a direct carbon cost: the
-    # three-arm benchmark measured TinyLlama emitting 1.6x the tokens of
+    # a three-arm routing comparison measured TinyLlama emitting 1.6x the tokens of
     # Qwen2.5-1.5B on identical prompts. The caps sit well above observed mean
     # lengths, so they act as a rail against runaway generation rather than
     # routine truncation, and CSS prices each candidate against the same ceiling.
@@ -5577,686 +5576,200 @@ def api_agent_status() -> dict[str, Any]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Workflow automation (n8n / Make style) — carbon-aware orchestration.
+# Model onboarding (/api/models)
 #
-# The engine (workflows.py) is dependency-free and never imports this module; we
-# hand it the heavy capabilities here as callables, exactly like the coding
-# agent's set_inference_fn. Every AI node therefore reuses the SAME CSS
-# greenest-feasible routing, guardrails, RAG, and carbon accounting as /api/chat —
-# a workflow is just those primitives wired into a graph, with a carbon receipt.
+# Browse Hugging Face, size a quantization plan against real headroom, download,
+# serve, and register. The pipeline exists because measurement showed CSS
+# losing to always-full on both axes — the ladder has no genuinely cheaper rung,
+# and a router can only be as good as the candidates it ranks.
+#
+# Route order matters: the static single-segment paths are declared before
+# `/{model_id}/...` so a literal "jobs" or "registry" is never parsed as a
+# model id.
 # ─────────────────────────────────────────────────────────────────────────────
-class WorkflowModel(BaseModel):
-    name: str = "Untitled workflow"
-    description: str = ""
-    enabled: bool = True
-    graph: dict[str, Any] = {}
+
+_ONBOARDING_SERVICE: ModelOnboardingService | None = None
 
 
-class WorkflowRunModel(BaseModel):
-    input: dict[str, Any] | None = None
-
-
-class WorkflowCredentialModel(BaseModel):
-    name: str
-    type: str = "bearer"                   # bearer | basic | header
-    secret: dict[str, Any] = {}            # {token} | {username,password} | {name,value}
-
-
-class WorkflowApprovalModel(BaseModel):
-    node_id: str | None = None            # single-approval convenience
-    approved: bool = True
-    note: str | None = None
-    by: str | None = None
-    approvals: dict[str, dict[str, Any]] | None = None  # multi-approval map
-
-
-async def _wf_llm(prompt: str, user_tier: str = "standard",
-                  accuracy_floor: float | None = None,
-                  tenant_id: str = DEFAULT_TENANT_ID) -> dict[str, Any]:
-    """LLM node → the full CSS-routed chat pipeline. Runs ephemerally (no
-    conversation persisted) so a workflow does not pollute chat history."""
-    result = await process_chat_request(
-        prompt=prompt,
-        user_tier=user_tier,
-        accuracy_floor=accuracy_floor,
-        tenant_id=tenant_id,
-    )
-    assistant = result.get("assistant_message") or {}
-    meta = assistant.get("metadata") or {}
-    sus = meta.get("sustainability") or {}
-    carbon = sus.get("estimated_request_co2_g")
-    if carbon in (None, ""):
-        carbon = (sus.get("carbon_accounting") or {}).get("total_carbon_g", 0.0)
-    return {
-        "text": assistant.get("content", ""),
-        "model_variant": result.get("model_variant"),
-        "carbon_g": float(carbon or 0.0),
-    }
-
-
-def _wf_rag(query: str, top_k: int = 6, tenant_id: str = DEFAULT_TENANT_ID) -> dict[str, Any]:
-    payload = rag_service.retrieve(query=query, top_k=top_k, tenant_id=tenant_id)
-    return {
-        "context": payload.get("context", ""),
-        "sources": payload.get("sources", []),
-        "retrieved_count": payload.get("retrieved_count", 0),
-    }
-
-
-def _wf_guardrails(text: str, phase: str = "input") -> dict[str, Any]:
-    return apply_guardrails(text, phase=phase)
-
-
-def _wf_agent(task: str, tests: Any = None, carbon_budget_g: float | None = None,
-              allow_defer: bool = False) -> dict[str, Any]:
-    import coding_agent
-    if not coding_agent.AGENT_ENABLED:
-        raise RuntimeError("agent harness disabled (AGENT_ENABLED)")
-    coding_agent.set_inference_fn(run_vllm_inference, _is_vllm_live)
-    result = coding_agent.run_coding_task(
-        task=task, tests=tests, carbon_budget_g=carbon_budget_g,
-        allow_defer=allow_defer, on_complete=_log_agent_result,
-    )
-    return {
-        "status": result.get("status"),
-        "task_id": result.get("task_id"),
-        "carbon_g": float(result.get("carbon_per_completion_g", 0.0) or 0.0),
-        "files": result.get("files", {}),
-        "spec_source": result.get("spec_source"),
-    }
-
-
-def _wf_image(prompt: str, steps: int = 24) -> dict[str, Any]:
-    # A minimal synthetic candidate: image nodes are pluggable-NIM with graceful
-    # placeholder fallback, so this works even with no diffusion endpoint set.
-    candidate = {"model_variant": "image-gen", "diffusion_steps": steps}
-    gen = run_image_generation(candidate, prompt, steps)
-    return {"image": gen.get("image_data_uri"), "backend": gen.get("backend"),
-            "carbon_g": _estimate_image_carbon_g(int(gen.get("steps") or steps))}
-
-
-def _estimate_image_carbon_g(steps: int) -> float:
-    """Carbon estimate for one diffusion run at the live grid CI.
-
-    run_image_generation reports no carbon of its own -- it is a pluggable
-    NIM/HF/placeholder call -- so the node priced its output at a hardcoded 0.0,
-    which quietly told every workflow receipt that image generation was free.
-    Priced here via model_zoo, the same way the chat path prices a routed
-    candidate. Duration is taken as linear in denoise steps at ~0.12 s/step,
-    which is an SDXL-class figure and the weakest assumption in this function.
-    """
-    model_id = "black-forest-labs/flux.1-dev" if NIM_FLUX_URL else "stabilityai/stable-diffusion-xl"
-    duration_s = max(0.1, steps * 0.12)
-    try:
-        breakdown = get_model_zoo().compute_total_carbon(
-            model_id=model_id,
-            grid_carbon_g_per_kwh=_wf_grid_ci(),
-            inference_duration_s=duration_s,
-        )
-        return float(breakdown.get("total_carbon_g", 0.0) or 0.0)
-    except Exception:  # noqa: BLE001 - carbon accounting is best-effort telemetry
-        logger.debug("image carbon estimate failed", exc_info=True)
-        return 0.0
-
-
-def _wf_grid_ci() -> float:
+def _current_grid_ci() -> float:
+    """Live grid carbon intensity, for metering one-off jobs (quantization)."""
     return safe_float(fetch_grid_signal().get("carbon_intensity"), 400.0)
 
 
-def _wf_decrypt_credential(cred_id: str, tenant_id: str) -> dict[str, Any] | None:
-    """Resolve a credential id → {type, secret:{...}} with the secret decrypted.
+def _resolve_hf_token() -> str:
+    """Prefer the encrypted token over the plaintext env var.
 
-    Called only at HTTP-node dispatch. The lookup is scoped to the running
-    workflow's tenant: the node's URL is author-controlled, so resolving another
-    tenant's credential here would post their secret to a server of the author's
-    choosing. The plaintext goes into request headers and nowhere else.
+    HF_TOKEN in .env is readable by anything that can read the file. HF_TOKEN_ENC
+    holds a secret-box token decryptable only with SECRET_KEY, so the token is
+    not sitting in plaintext for anything that can read the file.
     """
-    rec = workflow_store.get_credential_token(cred_id, tenant_id)
-    if not rec:
-        return None
-    try:
-        secret = json.loads(secret_decrypt(rec["secret_token"], WF_SECRET_KEY))
-    except (ValueError, json.JSONDecodeError) as exc:
-        logger.warning("credential %s failed to decrypt: %s", cred_id, exc)
-        return None
-    return {"type": rec["type"], "secret": secret}
-
-
-_WORKFLOW_ENGINE: WorkflowEngine | None = None
-
-
-def _get_workflow_engine() -> WorkflowEngine:
-    global _WORKFLOW_ENGINE
-    if _WORKFLOW_ENGINE is None:
-        _WORKFLOW_ENGINE = WorkflowEngine(WorkflowServices(
-            llm=_wf_llm, rag_retrieve=_wf_rag, guardrails=_wf_guardrails,
-            agent_run=_wf_agent, image_gen=_wf_image, grid_ci=_wf_grid_ci,
-            # Sub-workflow node resolves saved workflows by id (tenant-agnostic).
-            load_workflow=lambda wid: workflow_store.get_workflow(wid),
-            decrypt_credential=_wf_decrypt_credential,
-        ))
-    return _WORKFLOW_ENGINE
-
-
-# In-flight run cancel tokens, keyed by run id. A cancel request sets the event;
-# the engine checks it between supersteps and finalises the run as 'cancelled'.
-_wf_run_tokens: dict[str, asyncio.Event] = {}
-
-# How many error-handler hops may chain off one failing run. 1 means: a normal
-# run may dispatch its handler, but a failing handler dispatches nothing further.
-WF_MAX_ERROR_DEPTH = int(os.getenv("WF_MAX_ERROR_DEPTH", "1"))
-
-
-async def _execute_workflow_run(
-    wf: dict[str, Any], run_id: str, trigger_input: Any,
-    resume_state: dict[str, Any] | None = None,
-    approvals: dict[str, dict[str, Any]] | None = None,
-    error_depth: int = 0,
-) -> None:
-    """Background task: run (or resume) one workflow and stream node states into
-    the run row. A ``paused`` outcome parks the run as ``awaiting_approval`` with
-    its resume blob; a later approval calls back in with ``resume_state``. On a
-    ``failed``/``cancelled`` outcome an ``on_error_workflow_id`` (if declared) is
-    dispatched with the error context as its trigger payload.
-
-    ``error_depth`` is how many error-handler hops led here (0 for a normal run).
-    It bounds the chain, so a self-referencing or cyclic handler terminates."""
-    engine = _get_workflow_engine()
-    cancel_event = _wf_run_tokens.setdefault(run_id, asyncio.Event())
-
-    def _progress(states: list[dict[str, Any]], carbon: float) -> None:
-        workflow_store.update_run(run_id, node_states=states, total_carbon_g=round(carbon, 6))
-
-    try:
-        outcome = await engine.execute(
-            wf["graph"], trigger_input=trigger_input,
-            tenant_id=wf["tenant_id"], on_progress=_progress,
-            resume_state=resume_state, approvals=approvals,
-            cancel_event=cancel_event,
-        )
-        if outcome["status"] == "paused":
-            workflow_store.update_run(
-                run_id, status="awaiting_approval",
-                total_carbon_g=outcome["total_carbon_g"], node_states=outcome["node_states"],
-                engine_state=outcome["state"], awaiting=outcome["awaiting"], error=outcome.get("error"),
-            )
-        else:
-            workflow_store.update_run(
-                run_id, status=outcome["status"], finished_at=workflows_now(),
-                total_carbon_g=outcome["total_carbon_g"], node_states=outcome["node_states"],
-                error=outcome.get("error"), engine_state=None, awaiting=[],
-            )
-            if outcome["status"] in ("failed", "cancelled"):
-                _dispatch_error_workflow(wf, run_id, outcome, error_depth)
-    except Exception as exc:  # noqa: BLE001 - surface any engine crash on the run
-        logger.exception("workflow run %s crashed", run_id)
-        workflow_store.update_run(
-            run_id, status="failed", finished_at=workflows_now(),
-            error=f"{type(exc).__name__}: {exc}",
-        )
-    finally:
-        _wf_run_tokens.pop(run_id, None)
-    workflow_store.update_workflow(wf["id"], tenant_id=wf["tenant_id"], last_run_at=workflows_now())
-
-
-def _dispatch_error_workflow(wf: dict[str, Any], run_id: str, outcome: dict[str, Any],
-                             error_depth: int = 0) -> None:
-    """Run the workflow's ``on_error_workflow_id`` (from graph settings) as a
-    failure handler, with the error context as its trigger payload.
-
-    Bounded by ``WF_MAX_ERROR_DEPTH``: without it, a handler pointing at itself
-    (or any A->B->A cycle) respawns on every failure and never terminates."""
-    err_wf_id = ((wf.get("graph") or {}).get("settings") or {}).get("on_error_workflow_id")
-    if not err_wf_id:
-        return
-    if error_depth >= WF_MAX_ERROR_DEPTH:
-        logger.warning("error-workflow chain depth %d reached for %s; not dispatching %s",
-                       error_depth, wf["id"], err_wf_id)
-        return
-    if err_wf_id == wf["id"]:
-        logger.warning("workflow %s declares itself as its error handler; skipping", wf["id"])
-        return
-    err_wf = workflow_store.get_workflow(err_wf_id, tenant_id=wf["tenant_id"])
-    if not err_wf or not err_wf.get("enabled"):
-        logger.info("error workflow %s missing or disabled; skipping", err_wf_id)
-        return
-    failed = next((s["id"] for s in outcome.get("node_states", [])
-                   if s.get("status") == "failed"), None)
-    payload = {"workflow_id": wf["id"], "run_id": run_id,
-               "error": outcome.get("error"), "failed_node": failed}
-    try:
-        _start_workflow_run(err_wf, "error", payload, error_depth=error_depth + 1)
-    except Exception:  # noqa: BLE001 - never let error handling crash the caller
-        logger.exception("failed to dispatch error workflow %s", err_wf_id)
-
-
-def workflows_now() -> str:
-    from workflows import utc_now_iso
-    return utc_now_iso()
-
-
-def _wf_full_power_w() -> float | None:
-    """Power draw of the always-on 'full' candidate, for the receipt baseline."""
-    for target in load_routing_targets(ROUTING_TARGETS_PATH):
-        if target.get("model_variant") == "full" and target.get("hardware") == "vgpu":
-            power = safe_float(target.get("power_w"), 0.0)
-            return power or None
-    return None
-
-
-def _wf_power_by_variant() -> dict[str, float]:
-    """model_variant → power draw, preferring the vGPU row for each variant."""
-    out: dict[str, float] = {}
-    for target in load_routing_targets(ROUTING_TARGETS_PATH):
-        variant = target.get("model_variant")
-        power = safe_float(target.get("power_w"), 0.0)
-        if not variant or power <= 0:
-            continue
-        if variant not in out or target.get("hardware") == "vgpu":
-            out[variant] = power
-    return out
-
-
-def _build_run_receipt(run: dict[str, Any]) -> dict[str, Any]:
-    """Carbon receipt for a run: the actual total, an approximate
-    'always-full-cloud' counterfactual, and the difference.
-
-    Each model node's carbon is re-priced by the ratio of the full candidate's
-    power draw to the variant that actually served it. Power is the right basis
-    because operational carbon here is power x duration (see
-    model_zoo.compute_operational_carbon) -- FLOP counts do not enter it.
-
-    This is an APPROXIMATION and is labelled as one: node_states persist carbon
-    and model_variant but not token counts or per-node duration of the model call
-    itself, so the counterfactual assumes the same wall-clock on the bigger
-    model. A larger model is generally slower, so the saving is if anything
-    understated. Nodes with no model_variant contribute equally to both sides.
-    """
-    power_by_variant = _wf_power_by_variant()
-    full_power = _wf_full_power_w()
-    per_node: list[dict[str, Any]] = []
-    by_model: dict[str, float] = {}
-    total = 0.0
-    baseline = 0.0
-    for state in run.get("node_states", []):
-        carbon = safe_float(state.get("carbon_g"), 0.0)
-        total += carbon
-        output = state.get("output") if isinstance(state.get("output"), dict) else {}
-        variant = output.get("model_variant") if isinstance(output, dict) else None
-        node_baseline = carbon
-        if variant and full_power and power_by_variant.get(variant):
-            node_baseline = carbon * (full_power / power_by_variant[variant])
-        baseline += node_baseline
-        per_node.append({"id": state.get("id"), "type": state.get("type"),
-                         "model_variant": variant, "carbon_g": round(carbon, 6)})
-        if variant:
-            by_model[variant] = round(by_model.get(variant, 0.0) + carbon, 6)
-    savings = max(0.0, baseline - total)
-    pct = round((savings / baseline) * 100, 1) if baseline > 0 else 0.0
-    return {
-        "run_id": run.get("id"),
-        "total_g": round(total, 6),
-        "baseline_g": round(baseline, 6),
-        "savings_g": round(savings, 6),
-        "savings_pct": pct,
-        "per_node": per_node,
-        "by_model": by_model,
-        "approximate": True,
-        "basis": "power_w ratio vs the 'full' candidate; equal duration assumed",
-    }
-
-
-def _start_workflow_run(wf: dict[str, Any], trigger: str, trigger_input: Any,
-                        error_depth: int = 0) -> dict[str, Any]:
-    """Validate, create a 'running' run row, and dispatch execution in the
-    background so the caller gets a run id immediately (poll for the outcome).
-
-    ``error_depth`` is non-zero only when this run *is* an error handler; it is
-    forwarded so the chain stays bounded (see ``_dispatch_error_workflow``)."""
-    validate_graph(wf["graph"])  # raises ValueError → 400 before any carbon
-    seed_states = [
-        {"id": n["id"], "type": n.get("type"),
-         "label": n.get("label") or n.get("type"), "status": "pending",
-         "output": None, "carbon_g": 0.0, "error": None}
-        for n in wf["graph"].get("nodes", [])
-    ]
-    run = workflow_store.create_run(wf["id"], wf["tenant_id"], trigger, seed_states)
-    asyncio.create_task(_execute_workflow_run(wf, run["id"], trigger_input,
-                                              error_depth=error_depth))
-    return run
-
-
-# ── Trigger scheduler ────────────────────────────────────────────────────────
-# Polls enabled workflows and fires `schedule` (cron) and `carbon_window`
-# triggers. This is what makes the automation autonomous — no external cron
-# needed. Cheap: one tick lists workflows from SQLite and matches in-process.
-WF_SCHEDULER_ENABLED = os.getenv("WF_SCHEDULER_ENABLED", "true").lower() in ("1", "true", "yes")
-WF_SCHEDULER_INTERVAL_S = int(os.getenv("WF_SCHEDULER_INTERVAL_S", "30"))
-WF_CARBON_WINDOW_DEBOUNCE_S = int(os.getenv("WF_CARBON_WINDOW_DEBOUNCE_S", "3600"))
-_wf_sched_task: asyncio.Task | None = None
-_wf_last_fired: dict[tuple[str, str], str] = {}   # (workflow_id, node_id) -> minute key / ts
-
-
-def _wf_should_fire(wf: dict[str, Any], node: dict[str, Any], now: datetime, grid_ci: float) -> bool:
-    """Decide if one trigger node should fire this tick, de-duplicating so a cron
-    minute fires once and a carbon window fires at most once per debounce period."""
-    key = (wf["id"], node.get("id", ""))
-    ntype = node.get("type")
-    if ntype == "schedule":
-        cron = (node.get("params") or {}).get("cron", "")
-        if not cron or not cron_matches(str(cron), now):
-            return False
-        minute_key = now.strftime("%Y-%m-%dT%H:%M")
-        if _wf_last_fired.get(key) == minute_key:
-            return False
-        _wf_last_fired[key] = minute_key
-        return True
-    if ntype == "carbon_window":
-        threshold = safe_float((node.get("params") or {}).get("threshold_g"), 250.0)
-        if grid_ci > threshold:
-            return False
-        last = _wf_last_fired.get(key)
-        now_ts = now.timestamp()
-        if last is not None and (now_ts - float(last)) < WF_CARBON_WINDOW_DEBOUNCE_S:
-            return False
-        _wf_last_fired[key] = str(now_ts)
-        return True
-    return False
-
-
-async def _workflow_scheduler_tick() -> None:
-    now = datetime.now(timezone.utc)
-    try:
-        grid_ci = _wf_grid_ci()
-    except Exception:  # noqa: BLE001 - telemetry best-effort
-        grid_ci = 400.0
-    for wf in workflow_store.list_workflows(tenant_id=None):
-        if not wf.get("enabled"):
-            continue
-        for node in (wf.get("graph") or {}).get("nodes", []):
-            if node.get("type") not in ("schedule", "carbon_window"):
-                continue
-            if _wf_should_fire(wf, node, now, grid_ci):
-                try:
-                    run = _start_workflow_run(wf, node["type"], {"fired_at": now.isoformat(), "grid_ci": grid_ci})
-                    logger.info("workflow scheduler fired %s (%s) → run %s", wf["id"], node["type"], run["id"])
-                except ValueError:
-                    logger.warning("workflow scheduler: %s has an invalid graph; skipping", wf["id"])
-                except Exception:  # noqa: BLE001
-                    logger.exception("workflow scheduler failed to fire %s", wf["id"])
-
-
-async def _workflow_scheduler_loop() -> None:
-    logger.info("workflow scheduler started (interval %ss)", WF_SCHEDULER_INTERVAL_S)
-    while True:
+    enc = os.getenv("HF_TOKEN_ENC", "").strip()
+    if enc:
         try:
-            await _workflow_scheduler_tick()
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001 - never let the loop die on one bad tick
-            logger.exception("workflow scheduler tick errored")
-        await asyncio.sleep(WF_SCHEDULER_INTERVAL_S)
-
-
-@app.get("/api/workflows/node-types")
-def api_workflow_node_types() -> dict[str, Any]:
-    """The node palette: every registered node type with its params (for the UI)."""
-    return {"node_types": node_types_public()}
-
-
-# NOTE: the /templates routes are declared before /{workflow_id} so "templates"
-# is not captured as a workflow id.
-@app.get("/api/workflows/templates")
-def api_workflow_templates() -> dict[str, Any]:
-    """Gallery of seeded, runnable workflow templates (summaries)."""
-    import workflow_templates
-    return {"templates": workflow_templates.list_templates()}
-
-
-@app.get("/api/workflows/templates/{template_id}")
-def api_workflow_template_get(template_id: str) -> dict[str, Any]:
-    import workflow_templates
-    tpl = workflow_templates.get_template(template_id)
-    if tpl is None:
-        raise HTTPException(status_code=404, detail=f"unknown template {template_id}")
-    return tpl
-
-
-@app.post("/api/workflows/templates/{template_id}/instantiate")
-def api_workflow_template_instantiate(template_id: str, payload: WorkflowModel | None = None,
-                                      tenant_id: str = Depends(resolve_tenant)) -> dict[str, Any]:
-    """Copy a template's graph into a new, editable workflow owned by the tenant."""
-    import workflow_templates
-    tpl = workflow_templates.get_template(template_id)
-    if tpl is None:
-        raise HTTPException(status_code=404, detail=f"unknown template {template_id}")
-    override = payload.name if payload else None
-    name = override if (override and override != "Untitled workflow") else tpl["name"]
-    return workflow_store.create_workflow(
-        name=name, graph=tpl["graph"], description=tpl["description"],
-        tenant_id=tenant_id, enabled=False,   # created disabled so a scheduled template doesn't fire before review
-    )
-
-
-@app.get("/api/workflows")
-def api_workflows_list(tenant_id: str = Depends(resolve_tenant)) -> dict[str, Any]:
-    return {"workflows": workflow_store.list_workflows(tenant_id=tenant_id)}
-
-
-@app.post("/api/workflows")
-def api_workflow_create(payload: WorkflowModel,
-                        tenant_id: str = Depends(resolve_tenant)) -> dict[str, Any]:
-    if payload.graph:
-        try:
-            validate_graph(payload.graph)
+            return secret_decrypt(enc, SECRET_KEY)
         except ValueError as exc:
-            raise HTTPException(status_code=400, detail=f"invalid graph: {exc}") from exc
-    return workflow_store.create_workflow(
-        name=payload.name, graph=payload.graph, description=payload.description,
-        tenant_id=tenant_id, enabled=payload.enabled,
-    )
+            logger.warning("HF_TOKEN_ENC failed to decrypt (%s); falling back to HF_TOKEN", exc)
+    return os.getenv("HF_TOKEN", "").strip()
 
 
-# NOTE: /credentials is declared before /{workflow_id} so it is not parsed as an id.
-@app.get("/api/workflows/credentials")
-def api_workflow_credentials_list(tenant_id: str = Depends(resolve_tenant)) -> dict[str, Any]:
-    """List credentials for the tenant — id/name/type only, never the secret."""
-    return {"credentials": workflow_store.list_credentials(tenant_id=tenant_id)}
+def _get_onboarding_service() -> ModelOnboardingService:
+    global _ONBOARDING_SERVICE
+    if _ONBOARDING_SERVICE is None:
+        _ONBOARDING_SERVICE = ModelOnboardingService(
+            get_model_zoo(),
+            hf_token=_resolve_hf_token(),
+            # The module never imports decision_engine (that would cycle), so
+            # grid carbon arrives as an injected callable.
+            grid_ci=_current_grid_ci,
+            # The API container has no nvidia-smi, so the sidecar is the only
+            # in-container source of GPU occupancy. When it reports zeros (its
+            # default — DISABLE_GPU_METRICS=1), the planner refuses to size
+            # rather than assuming the slice is empty.
+            system_metrics=fetch_system_metrics,
+            state_path=DATA_DIR / "model_onboarding.json",
+        )
+    return _ONBOARDING_SERVICE
 
 
-@app.post("/api/workflows/credentials")
-def api_workflow_credential_create(payload: WorkflowCredentialModel,
-                                   tenant_id: str = Depends(resolve_tenant)) -> dict[str, Any]:
-    """Store an encrypted credential. The response never echoes the secret."""
-    if payload.type not in ("bearer", "basic", "header"):
-        raise HTTPException(status_code=400, detail="type must be bearer | basic | header")
-    token = secret_encrypt(json.dumps(payload.secret or {}), WF_SECRET_KEY)
-    return workflow_store.create_credential(
-        name=payload.name, cred_type=payload.type, secret_token=token, tenant_id=tenant_id)
+def _audit_onboarding(action: str, detail: dict[str, Any]) -> None:
+    """Onboarding changes what the router may select, so it joins the audit trail."""
+    log_decision({"event": "model_onboarding", "action": action, **detail})
 
 
-@app.delete("/api/workflows/credentials/{credential_id}")
-def api_workflow_credential_delete(credential_id: str,
-                                   tenant_id: str = Depends(resolve_tenant)) -> dict[str, Any]:
-    if not workflow_store.delete_credential(credential_id, tenant_id=tenant_id):
-        raise HTTPException(status_code=404, detail=f"unknown credential {credential_id}")
-    return {"status": "deleted", "id": credential_id}
-
-
-@app.get("/api/workflows/{workflow_id}")
-def api_workflow_get(workflow_id: str,
-                     tenant_id: str = Depends(resolve_tenant)) -> dict[str, Any]:
-    wf = workflow_store.get_workflow(workflow_id, tenant_id=tenant_id)
-    if wf is None:
-        raise HTTPException(status_code=404, detail=f"unknown workflow {workflow_id}")
-    return wf
-
-
-@app.put("/api/workflows/{workflow_id}")
-def api_workflow_update(workflow_id: str, payload: WorkflowModel,
-                        tenant_id: str = Depends(resolve_tenant)) -> dict[str, Any]:
-    if payload.graph:
-        try:
-            validate_graph(payload.graph)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=f"invalid graph: {exc}") from exc
-        # Refuse a self-referencing failure handler here so the author gets a 400,
-        # rather than discovering at runtime that it was silently skipped.
-        err_id = (payload.graph.get("settings") or {}).get("on_error_workflow_id")
-        if err_id and err_id == workflow_id:
-            raise HTTPException(
-                status_code=400,
-                detail="on_error_workflow_id cannot reference the workflow itself",
-            )
-    wf = workflow_store.update_workflow(
-        workflow_id, tenant_id=tenant_id, name=payload.name,
-        description=payload.description, enabled=payload.enabled, graph=payload.graph,
-    )
-    if wf is None:
-        raise HTTPException(status_code=404, detail=f"unknown workflow {workflow_id}")
-    return wf
-
-
-@app.delete("/api/workflows/{workflow_id}")
-def api_workflow_delete(workflow_id: str,
-                        tenant_id: str = Depends(resolve_tenant)) -> dict[str, Any]:
-    if not workflow_store.delete_workflow(workflow_id, tenant_id=tenant_id):
-        raise HTTPException(status_code=404, detail=f"unknown workflow {workflow_id}")
-    return {"status": "deleted", "id": workflow_id}
-
-
-@app.post("/api/workflows/{workflow_id}/run")
-async def api_workflow_run(workflow_id: str, payload: WorkflowRunModel | None = None,
-                           tenant_id: str = Depends(resolve_tenant)) -> dict[str, Any]:
-    wf = workflow_store.get_workflow(workflow_id, tenant_id=tenant_id)
-    if wf is None:
-        raise HTTPException(status_code=404, detail=f"unknown workflow {workflow_id}")
+@app.get("/api/models/capability")
+def api_models_capability() -> dict[str, Any]:
+    """What onboarding can actually do on this host, and why not when it cannot."""
     try:
-        run = _start_workflow_run(wf, "manual", (payload.input if payload else None) or {})
+        return _get_onboarding_service().capability()
+    except Exception as exc:  # noqa: BLE001 - capability must never 500
+        return {"enabled": False, "reason": f"onboarding unavailable: {exc}"}
+
+
+@app.get("/api/models/catalog/search")
+def api_models_search(q: str = "", limit: int = 25, task: str | None = "text-generation") -> dict[str, Any]:
+    svc = _get_onboarding_service()
+    try:
+        return {"results": svc.search(q, limit=limit, task=task or None)}
+    except HFError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/models/catalog/preview")
+def api_models_preview(
+    repo_id: str,
+    max_model_len: int = 2048,
+    prefer: str | None = None,
+    allow_local_quantize: bool = False,
+) -> dict[str, Any]:
+    """Plan without committing: what would be downloaded, at what size, and why."""
+    svc = _get_onboarding_service()
+    try:
+        return svc.preview(
+            repo_id,
+            max_model_len=max_model_len,
+            prefer=prefer,
+            allow_local_quantize=allow_local_quantize,
+        )
+    except HFError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/models/registry")
+def api_models_registry() -> dict[str, Any]:
+    return {"models": _get_onboarding_service().registry()}
+
+
+@app.get("/api/models/jobs")
+def api_models_jobs(limit: int = 50) -> dict[str, Any]:
+    return {"jobs": _get_onboarding_service().list_jobs(limit=limit)}
+
+
+@app.get("/api/models/jobs/{job_id}")
+def api_models_job(job_id: str) -> dict[str, Any]:
+    job = _get_onboarding_service().get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"job {job_id} not found")
+    return job.to_dict()
+
+
+@app.post("/api/models/onboard")
+async def api_models_onboard(request: Request) -> dict[str, Any]:
+    body = await request.json()
+    repo_id = str(body.get("repo_id") or "").strip()
+    if not repo_id:
+        raise HTTPException(status_code=400, detail="repo_id is required")
+    svc = _get_onboarding_service()
+    try:
+        job = svc.start(
+            repo_id,
+            model_id=body.get("model_id"),
+            max_model_len=int(body.get("max_model_len") or 2048),
+            prefer=body.get("prefer"),
+            allow_local_quantize=bool(body.get("allow_local_quantize")),
+            auto_serve=bool(body.get("auto_serve")),
+            trust_remote_code=bool(body.get("trust_remote_code")),
+            donor_id=body.get("donor_id"),
+            max_output_tokens=int(body.get("max_output_tokens") or 512),
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f"invalid graph: {exc}") from exc
-    return run
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _audit_onboarding("start", {"repo_id": repo_id, "job_id": job.job_id, "model_id": job.model_id})
+    return job.to_dict()
 
 
-@app.post("/api/workflows/webhook/{workflow_id}")
-async def api_workflow_webhook(workflow_id: str, request: Request) -> dict[str, Any]:
-    """Public webhook trigger. The JSON body becomes the trigger output. Tenant
-    is resolved from the workflow itself (webhooks carry no auth header)."""
-    wf = workflow_store.get_workflow(workflow_id)  # tenant-agnostic lookup
-    if wf is None:
-        raise HTTPException(status_code=404, detail=f"unknown workflow {workflow_id}")
-    if not wf["enabled"]:
-        raise HTTPException(status_code=409, detail="workflow is disabled")
+@app.post("/api/models/{model_id}/serve")
+async def api_models_serve(model_id: str, request: Request) -> dict[str, Any]:
+    body = await request.json() if await request.body() else {}
+    svc = _get_onboarding_service()
     try:
-        body = await request.json()
-    except Exception:  # noqa: BLE001 - empty/non-JSON body is fine
-        body = {}
-    try:
-        run = _start_workflow_run(wf, "webhook", body if isinstance(body, dict) else {"value": body})
+        result = svc.serve(model_id, trust_remote_code=bool(body.get("trust_remote_code")))
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f"invalid graph: {exc}") from exc
-    return {"status": "accepted", "run_id": run["id"]}
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _audit_onboarding("serve", {"model_id": model_id, "ok": result["ok"], "detail": result["detail"]})
+    return result
 
 
-@app.get("/api/workflows/{workflow_id}/runs")
-def api_workflow_runs(workflow_id: str, limit: int = 30,
-                      tenant_id: str = Depends(resolve_tenant)) -> dict[str, Any]:
-    return {"runs": workflow_store.list_runs(
-        workflow_id=workflow_id, tenant_id=tenant_id, limit=max(1, min(limit, 100)))}
+@app.post("/api/models/{model_id}/unserve")
+def api_models_unserve(model_id: str) -> dict[str, Any]:
+    result = _get_onboarding_service().unserve(model_id)
+    _audit_onboarding("unserve", {"model_id": model_id, "ok": result["ok"]})
+    return result
 
 
-@app.get("/api/workflows/runs/{run_id}")
-def api_workflow_run_status(run_id: str) -> dict[str, Any]:
-    run = workflow_store.get_run(run_id)
-    if run is None:
-        raise HTTPException(status_code=404, detail=f"unknown run {run_id}")
-    run.pop("engine_state", None)  # internal resume blob — not part of the API surface
-    return run
+@app.post("/api/models/{model_id}/measure")
+async def api_models_measure(model_id: str, request: Request) -> dict[str, Any]:
+    """Promote an onboarded model to routable using measured figures.
 
-
-@app.post("/api/workflows/runs/{run_id}/approve")
-async def api_workflow_run_approve(run_id: str, payload: WorkflowApprovalModel,
-                                   tenant_id: str = Depends(resolve_tenant)) -> dict[str, Any]:
-    """Resolve a human-approval node on a paused run and resume it (LangGraph
-    interrupt/resume). Body: {node_id, approved, note?} — or {approvals: {...}}."""
-    run = workflow_store.get_run(run_id)
-    if run is None:
-        raise HTTPException(status_code=404, detail=f"unknown run {run_id}")
-    if run.get("tenant_id") not in (tenant_id, None):
-        raise HTTPException(status_code=404, detail=f"unknown run {run_id}")
-    if run.get("status") != "awaiting_approval":
-        raise HTTPException(status_code=409, detail=f"run is '{run.get('status')}', not awaiting approval")
-    state = run.get("engine_state")
-    if not state:
-        raise HTTPException(status_code=409, detail="run has no saved state to resume")
-
-    awaiting_ids = {a["id"] for a in run.get("awaiting", [])}
-    decisions: dict[str, dict[str, Any]] = dict(payload.approvals or {})
-    if payload.node_id:
-        decisions[payload.node_id] = {"approved": bool(payload.approved),
-                                      "note": payload.note or "", "by": payload.by or ""}
-    if not decisions:
-        raise HTTPException(status_code=400, detail="provide node_id (+approved) or approvals map")
-    unknown = set(decisions) - awaiting_ids
-    if unknown:
-        raise HTTPException(status_code=400, detail=f"not awaiting approval: {sorted(unknown)}")
-
-    wf = workflow_store.get_workflow(run["workflow_id"])
-    if wf is None:
-        raise HTTPException(status_code=404, detail="workflow no longer exists")
-
-    workflow_store.update_run(run_id, status="running")
-    asyncio.create_task(_execute_workflow_run(
-        wf, run_id, state.get("trigger_input"), resume_state=state, approvals=decisions))
-    return {"status": "resumed", "run_id": run_id, "decided": list(decisions)}
-
-
-@app.get("/api/workflows/runs/{run_id}/receipt")
-def api_workflow_run_receipt(run_id: str,
-                             tenant_id: str = Depends(resolve_tenant)) -> dict[str, Any]:
-    """Carbon receipt: actual total, per-node and per-model breakdown, and the
-    approximate saving against an always-full-cloud counterfactual."""
-    run = workflow_store.get_run(run_id)
-    if run is None or run.get("tenant_id") not in (tenant_id, None):
-        raise HTTPException(status_code=404, detail=f"unknown run {run_id}")
-    return _build_run_receipt(run)
-
-
-@app.post("/api/workflows/runs/{run_id}/cancel")
-def api_workflow_run_cancel(run_id: str,
-                            tenant_id: str = Depends(resolve_tenant)) -> dict[str, Any]:
-    """Cooperatively cancel an in-flight run. The engine finalises it as
-    'cancelled' between supersteps; nodes already running finish first."""
-    run = workflow_store.get_run(run_id)
-    if run is None or run.get("tenant_id") not in (tenant_id, None):
-        raise HTTPException(status_code=404, detail=f"unknown run {run_id}")
-    if run.get("status") != "running":
-        raise HTTPException(status_code=409, detail=f"run is '{run.get('status')}', not running")
-    _wf_run_tokens.setdefault(run_id, asyncio.Event()).set()
-    return {"status": "cancelling", "run_id": run_id}
-
-
-@app.get("/api/benchmark")
-def api_benchmark() -> dict[str, Any]:
-    """Latest three-arm routing benchmark, as written by `benchmark/report.py`.
-
-    The harness runs offline against an isolated API on :8101 (frozen router,
-    pinned grid) — this endpoint only serves the summary it left behind. No run
-    is ever triggered from here: a benchmark that the system under test can
-    start on demand is not a measurement.
+    This is the only path that sets ``available: true``. The measurement comes
+    from the caller's own evaluation, not from here — a system that can declare
+    its own quality has not measured anything.
     """
-    path = DATA_DIR / "benchmark_summary.json"
-    if not path.exists():
-        return {
-            "available": False,
-            "reason": "no benchmark has been run yet — see benchmark/README.md",
-        }
+    body = await request.json()
+    measurement = body.get("measurement") or {}
+    basis = str(body.get("basis") or "").strip()
+    if not basis:
+        raise HTTPException(
+            status_code=400,
+            detail="basis is required — it records where the figures came from (e.g. 'measured:onboard-bench-01')",
+        )
+    svc = _get_onboarding_service()
     try:
-        summary = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        return {"available": False, "reason": f"summary unreadable: {exc}"}
-    summary["available"] = True
-    return summary
+        entry = svc.apply_measurement(model_id, measurement, basis=basis)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _audit_onboarding(
+        "measure",
+        {
+            "model_id": model_id,
+            "basis": basis,
+            "accuracy_baseline": entry.get("accuracy_baseline"),
+            "latency_ms_p50": entry.get("latency_ms_p50"),
+            "available": entry.get("available"),
+        },
+    )
+    return entry
 
 
 if __name__ == "__main__":

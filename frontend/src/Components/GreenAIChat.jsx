@@ -10,8 +10,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { CarbonDashboard } from "./CarbonDashboard";
 import { ObservabilityPanel } from "./ObservabilityPanel";
 import { AgentPanel } from "./AgentPanel";
-import { BenchmarkPanel } from "./BenchmarkPanel";
-import { WorkflowsPanel } from "./WorkflowsPanel";
+import { ModelsPanel } from "./ModelsPanel";
 import {
   deleteConversation,
   fetchConversation,
@@ -35,7 +34,7 @@ import {
 } from "../lib/api";
 
 // ── Constants ─────────────────────────────────────────────────────────────────
-const TABS = ["Chat", "Carbon", "Observability", "Coding Arena", "Benchmark", "Workflows"];
+const TABS = ["Chat", "Carbon", "Observability", "Coding Arena", "Models"];
 const ROUTER_TIER = "standard";
 const SIDEBAR_REFRESH_MS = 30_000;   // grid, RL, RAG
 const QUEUE_REFRESH_MS   = 10_000;   // queue polls every 10 s (matches backend dispatch interval)
@@ -1667,8 +1666,7 @@ export function GreenAIChat() {
           {activeTab === 1 && <div className="chat-stage" style={{ overflowY: "auto", height: "100%" }}><CarbonDashboard /></div>}
           {activeTab === 2 && <div className="chat-stage" style={{ overflowY: "auto", height: "100%" }}><ObservabilityPanel /></div>}
           {activeTab === 3 && <div className="chat-stage" style={{ overflowY: "auto", height: "100%" }}><AgentPanel /></div>}
-          {activeTab === 4 && <div className="chat-stage" style={{ overflowY: "auto", height: "100%" }}><BenchmarkPanel /></div>}
-          {activeTab === 5 && <div className="chat-stage" style={{ overflow: "hidden", height: "100%" }}><WorkflowsPanel /></div>}
+          {activeTab === 4 && <div className="chat-stage" style={{ overflowY: "auto", height: "100%" }}><ModelsPanel /></div>}
 
           {activeTab === 0 && (
             <>

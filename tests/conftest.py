@@ -3,7 +3,7 @@
 Two rules hold across the suite:
 
 1. **Nothing writes to ``data/``.** Every stateful component here takes an
-   explicit path (``ModelZooService(zoo_path=…)``, ``WorkflowStore(db_path=…)``,
+   explicit path (``ModelZooService(zoo_path=…)``,
    ``RLPolicyController(state_path=…)``), so tests construct isolated instances
    rather than patching module-level constants — those are read at import time
    and monkeypatching the env after import would not take effect.
@@ -11,7 +11,7 @@ Two rules hold across the suite:
 2. **Tests import the dependency-light modules directly.** ``decision_engine``
    needs fastapi and the full backend stack, so it is deliberately not imported;
    logic that matters is tested against ``model_zoo`` / ``rl_controller`` /
-   ``workflows``, which are import-cycle-free by design.
+   ``model_onboarding``, which are import-cycle-free by design.
 """
 from __future__ import annotations
 
@@ -48,10 +48,3 @@ def shipped_zoo_path() -> Path:
     for golden values — retuning a real model must not break the carbon tests."""
     return REPO_ROOT / "config" / "model_zoo.json"
 
-
-@pytest.fixture
-def wf_store(tmp_path: Path):
-    """A WorkflowStore on a throwaway SQLite file."""
-    from workflows import WorkflowStore
-
-    return WorkflowStore(tmp_path / "wf_test.db")

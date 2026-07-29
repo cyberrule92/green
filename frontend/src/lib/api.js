@@ -349,13 +349,8 @@ export async function downloadCsrdReportCsv(opts = {}) {
   return URL.createObjectURL(blob);
 }
 
-// ── Routing benchmark ────────────────────────────────────────────────────────
 // Served from a summary the offline harness left in data/. Returns
 // { available: false, reason } when no run has been published yet.
-export function fetchBenchmark() {
-  return request("/api/benchmark");
-}
-
 // ── Agentic coding harness (LangGraph) ───────────────────────────────────────
 // Off the CSS path: CSS scores carbon per request, but an agent is a loop, so
 // the harness optimises carbon per *successful completion* instead.
@@ -397,101 +392,63 @@ export function fetchAgentTasks({ limit = 20 } = {}) {
   return request(`/api/agent/tasks?limit=${limit}`);
 }
 
-// ── Workflow automation (n8n / Make style, carbon-aware) ─────────────────────
-export function fetchWorkflowNodeTypes() {
-  return request("/api/workflows/node-types");
+// ── Model onboarding ─────────────────────────────────────────────────────────
+// Browse Hugging Face, size a quantization plan against real headroom, download,
+// serve, and register. An onboarded model stays unavailable to CSS until measured.
+
+export function fetchModelCapability() {
+  return request("/api/models/capability");
 }
 
-export function fetchWorkflows() {
-  return request("/api/workflows");
+export function searchHuggingFaceModels({ q = "", limit = 25, task = "text-generation" } = {}) {
+  const params = new URLSearchParams({ q, limit: String(limit) });
+  if (task) params.set("task", task);
+  return request(`/api/models/catalog/search?${params.toString()}`);
 }
 
-export function fetchWorkflow(id) {
-  return request(`/api/workflows/${id}`);
+export function previewModelPlan(repoId, { maxModelLen = 2048, prefer, allowLocalQuantize = false } = {}) {
+  const params = new URLSearchParams({ repo_id: repoId, max_model_len: String(maxModelLen) });
+  if (prefer) params.set("prefer", prefer);
+  if (allowLocalQuantize) params.set("allow_local_quantize", "true");
+  return request(`/api/models/catalog/preview?${params.toString()}`);
 }
 
-export function createWorkflow({ name, description = "", enabled = true, graph }) {
-  return request("/api/workflows", {
+export function onboardModel(body) {
+  return request("/api/models/onboard", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name, description, enabled, graph }),
+    body: JSON.stringify(body),
   });
 }
 
-export function updateWorkflow(id, { name, description = "", enabled = true, graph }) {
-  return request(`/api/workflows/${id}`, {
-    method: "PUT",
+export function fetchOnboardJobs(limit = 50) {
+  return request(`/api/models/jobs?limit=${limit}`);
+}
+
+export function fetchOnboardJob(jobId) {
+  return request(`/api/models/jobs/${jobId}`);
+}
+
+export function fetchModelRegistry() {
+  return request("/api/models/registry");
+}
+
+export function serveOnboardedModel(modelId, { trustRemoteCode = false } = {}) {
+  return request(`/api/models/${modelId}/serve`, {
+    method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name, description, enabled, graph }),
+    body: JSON.stringify({ trust_remote_code: trustRemoteCode }),
   });
 }
 
-export function deleteWorkflow(id) {
-  return request(`/api/workflows/${id}`, { method: "DELETE" });
+export function unserveOnboardedModel(modelId) {
+  return request(`/api/models/${modelId}/unserve`, { method: "POST" });
 }
 
-export function runWorkflow(id, input = {}) {
-  return request(`/api/workflows/${id}/run`, {
+export function measureOnboardedModel(modelId, { measurement, basis }) {
+  return request(`/api/models/${modelId}/measure`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ input }),
-  });
-}
-
-export function fetchWorkflowRun(runId) {
-  return request(`/api/workflows/runs/${runId}`);
-}
-
-export function fetchWorkflowRuns(id, { limit = 30 } = {}) {
-  return request(`/api/workflows/${id}/runs?limit=${limit}`);
-}
-
-export function approveWorkflowRun(runId, { nodeId, approved = true, note = "", by = "" } = {}) {
-  return request(`/api/workflows/runs/${runId}/approve`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ node_id: nodeId, approved, note, by }),
-  });
-}
-
-export function fetchWorkflowRunReceipt(runId) {
-  return request(`/api/workflows/runs/${runId}/receipt`);
-}
-
-export function cancelWorkflowRun(runId) {
-  return request(`/api/workflows/runs/${runId}/cancel`, { method: "POST" });
-}
-
-// ── Workflow credentials (the secret is never returned by list) ──────────────
-export function fetchWorkflowCredentials() {
-  return request("/api/workflows/credentials");
-}
-
-export function createWorkflowCredential({ name, type = "bearer", secret = {} }) {
-  return request("/api/workflows/credentials", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name, type, secret }),
-  });
-}
-
-export function deleteWorkflowCredential(credentialId) {
-  return request(`/api/workflows/credentials/${credentialId}`, { method: "DELETE" });
-}
-
-// ── Workflow template gallery ────────────────────────────────────────────────
-export function fetchWorkflowTemplates() {
-  return request("/api/workflows/templates");
-}
-
-export function fetchWorkflowTemplate(templateId) {
-  return request(`/api/workflows/templates/${templateId}`);
-}
-
-export function instantiateWorkflowTemplate(templateId, { name } = {}) {
-  return request(`/api/workflows/templates/${templateId}/instantiate`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(name ? { name } : {}),
+    body: JSON.stringify({ measurement, basis }),
   });
 }

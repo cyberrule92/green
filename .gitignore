@@ -6,6 +6,11 @@
 .env.*
 !.env.example
 deploy/env.production
+# Loose token scratch files. hf.txt held a live HF token in the repo root and
+# was one `git add .` away from being published.
+hf.txt
+*.tok
+*_token.txt
 
 # The deployment guide renders the live credentials into Appendix A by design.
 # It is regenerated from .env with: python3 docs/generate_deploy_pdf.py
@@ -16,8 +21,6 @@ docs/Adaptive_Green_AI_Deployment.pdf
 # private data, not source. hf-cache alone is 19 GB.
 # ---------------------------------------------------------------------------
 data/
-benchmark/results/
-benchmark/*.log
 
 # ---------------------------------------------------------------------------
 # Build output and environments
