@@ -1,0 +1,62 @@
+# Opt-in overlay: carbon-aware LoRA/QLoRA fine-tuning (/api/finetune).
+#
+# Layer this on top of the onboarding overlay, not instead of it. Training needs
+# the same Docker socket that dynamic serving does — the API launches a trainer
+# container and a vLLM container with --enable-lora — so this file only adds the
+# fine-tuning configuration and assumes docker-compose.onboarding.yml has already
+# granted the socket. Understand what that grants before enabling either: the
+# Docker socket is root-equivalent control of the host.
+#
+# Usage:
+#   docker compose -f docker-compose.ubuntu-vgpu.yml \
+#                  -f docker-compose.onboarding.yml \
+#                  -f docker-compose.finetune.yml \
+#                  --env-file .env up --build -d
+#
+# Build the two runner images first (they are one-shot jobs, not services, so
+# compose does not manage their lifecycle):
+#   docker build -f docker/finetune/Dockerfile -t green-finetune:latest .
+#   docker build -f docker/quantize/Dockerfile -t green-quantize:latest .
+#
+# Both derive from vllm/vllm-openai:latest, which is already on this host, so
+# each adds roughly a gigabyte rather than a fresh multi-GB torch.
+
+services:
+  api:
+    environment:
+      FINETUNE_ENABLED: ${FINETUNE_ENABLED:-true}
+
+      # The trainer. {base_repo} {dataset} {out_dir} {method} {lora_rank}
+      # {epochs} are substituted by FineTuningService before the container runs.
+      MODEL_FINETUNE_IMAGE: ${MODEL_FINETUNE_IMAGE:-green-finetune:latest}
+      MODEL_FINETUNE_COMMAND: >-
+        ${MODEL_FINETUNE_COMMAND:-python3 /opt/green/finetune_train.py
+        --base-repo {base_repo} --dataset {dataset} --out-dir {out_dir}
+        --method {method} --lora-rank {lora_rank} --epochs {epochs}}
+
+      # The AWQ calibration pass. {repo_id} {out_dir} are substituted by
+      # LocalQuantizer. Still gated a second time by allow_local_quantize on the
+      # request: configuring the toolchain does not mean every onboard should
+      # spend calibration carbon.
+      MODEL_QUANT_IMAGE: ${MODEL_QUANT_IMAGE:-green-quantize:latest}
+      MODEL_QUANT_COMMAND: >-
+        ${MODEL_QUANT_COMMAND:-python3 /opt/green/quantize_awq.py
+        --repo-id {repo_id} --out-dir {out_dir}}
+
+      # Carbon-aware scheduling. Nobody waits on a training job, which is what
+      # makes deferring it to the cleanest window in the forecast free.
+      FINETUNE_DEFER_CI: ${FINETUNE_DEFER_CI:-300}
+      FINETUNE_LOOKAHEAD_H: ${FINETUNE_LOOKAHEAD_H:-48}
+      FINETUNE_MAX_WAIT_S: ${FINETUNE_MAX_WAIT_S:-172800}
+      FINETUNE_WINDOW_POLL_S: ${FINETUNE_WINDOW_POLL_S:-300}
+      FINETUNE_CI_SAMPLE_S: ${FINETUNE_CI_SAMPLE_S:-300}
+      FINETUNE_TIMEOUT_S: ${FINETUNE_TIMEOUT_S:-86400}
+      FINETUNE_HARDWARE_EFFICIENCY: ${FINETUNE_HARDWARE_EFFICIENCY:-0.75}
+
+      # Host path, not a container path. It is handed to the Docker Engine API as
+      # the source of a bind mount for the trainer container, so the daemon
+      # resolves it on the host — and it must point at the same directory the
+      # API sees as /app/data/finetune, or the trainer is given a dataset path
+      # that does not exist.
+      FINETUNE_WORK_DIR: ${FINETUNE_WORK_DIR:-data/finetune}
+      FINETUNE_WORK_DIR_HOST: ${FINETUNE_WORK_DIR_HOST:-/opt/green/data/finetune}

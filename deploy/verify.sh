@@ -3,7 +3,7 @@
 #
 # Proves the four claims that separate this stack from a plain LLM gateway:
 # it routes on carbon, it reads a real grid signal, it signs every decision, and
-# the agent optimises carbon per *completed task* rather than per token.
+# coding requests reach the code-capable rung rather than a general chat model.
 # A green health check proves none of those, which is why this script exists.
 set -uo pipefail
 
@@ -16,15 +16,12 @@ inf() { printf '    %s\n' "$1"; }
 hdr() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 command -v jq >/dev/null || { echo "jq is required: sudo apt-get install -y jq"; exit 1; }
 J()   { jq -r "$1 // empty" 2>/dev/null; }
-# `false // empty` is empty in jq — and `escalated: false` is precisely the
-# result worth printing, so booleans need their own accessor.
-JB()  { jq -r "$1 | tostring" 2>/dev/null; }
 
 hdr "1 · Health"
 curl -sf "$API/health/ready" >/dev/null && ok "API ready (the metrics sidecar answered — /health/ready blocks on it)" \
                                         || bad "API not ready"
 curl -sf http://localhost:9000/health >/dev/null && ok "metrics sidecar" || bad "metrics sidecar down"
-for p in 8001 8002 8006 8009; do
+for p in 8001 8002 8006; do
   curl -sf "http://localhost:$p/health" >/dev/null 2>&1 \
     && ok "vLLM :$p live" \
     || inf "- vLLM :$p not running (expected if its compose profile is off)"
@@ -68,43 +65,31 @@ N=$(wc -l < data/decision_logs.jsonl 2>/dev/null || echo 0)
 [[ "$N" -gt 0 ]] && ok "decision_logs.jsonl: ${N} HMAC-signed rows (every dashboard reads this file and nothing else)" \
                  || bad "no audit rows written"
 
-hdr "5 · Agentic harness — carbon per successful completion"
-if curl -sf "$API/api/agent/status" >/dev/null; then
-  # Caller-supplied tests: the spec is frozen and validated BEFORE a token is spent.
-  # Left unset, the weakest rung authors the spec it is then judged against — the
-  # failure mode that costs ~100x the carbon and still fails.
-  TID=$(curl -sf -X POST "$API/api/agent/task" -H 'Content-Type: application/json' -d '{
-    "task": "Write fizzbuzz(n) in solution.py returning \"Fizz\", \"Buzz\", \"FizzBuzz\" or str(n).",
-    "tests": "from solution import fizzbuzz\ndef test_fizzbuzz():\n    assert fizzbuzz(3) == \"Fizz\"\n    assert fizzbuzz(5) == \"Buzz\"\n    assert fizzbuzz(15) == \"FizzBuzz\"\n    assert fizzbuzz(0) == \"FizzBuzz\"\n    assert fizzbuzz(7) == \"7\"\n",
-    "allow_defer": false }' | J ".task_id")
-  if [[ -z "${TID:-}" ]]; then
-    bad "agent task rejected (a 400 here means the test suite failed validation — that is the gate working)"
+hdr "5 · Coding requests reach the coding rung"
+# A coding prompt must land on the code-capable model, not a general instruct one.
+# There is a single coding rung (vllm-stem-coding); if it is down the request
+# silently falls through to a chat model and answers worse for the same carbon.
+C=$(mktemp)
+curl -sf -X POST "$API/api/chat" \
+  -F 'prompt=Write a Python function that reverses a string.' -o "$C" --max-time 180
+if [[ -s "$C" ]]; then
+  CVAR=$(J ".model_variant"       < "$C")
+  CMOD=$(J ".resolved_model_name" < "$C")
+  CCO2=$(J ".system_co2_g"        < "$C")
+  if [[ "$CVAR" == "stem-coding" ]]; then
+    ok "coding prompt routed to ${CVAR}"
+    inf "model            : ${CMOD}"
+    inf "gCO2             : ${CCO2}"
   else
-    inf "task ${TID} submitted; polling…"
-    for _ in $(seq 1 48); do
-      sleep 5
-      T=$(mktemp); curl -sf "$API/api/agent/task/$TID" -o "$T"
-      ST=$(J ".status" < "$T")
-      [[ "$ST" == "completed" || "$ST" == "failed" || "$ST" == "aborted" ]] && break
-    done
-    if [[ "$ST" == "completed" ]]; then
-      ok "agent COMPLETED"
-      inf "rung          : $(J ".result.final_tier"               < "$T")"
-      inf "escalated     : $(JB ".result.escalated"               < "$T")  (false = the greenest rung was enough)"
-      inf "LLM calls     : $(J ".result.total_llm_calls"          < "$T")"
-      inf "spec author   : $(J ".result.spec_source"              < "$T")  (caller = your tests are the ground truth)"
-      inf "gCO2 / completion: $(J ".result.carbon_per_completion_g" < "$T")"
-    else
-      bad "agent did not complete (status=${ST:-unknown}) — docker compose logs api"
-    fi
-    rm -f "$T"
+    bad "coding prompt routed to '${CVAR}', not stem-coding — is vllm-stem-coding (:8006) up? Start it with the 'stem-coding' profile."
   fi
 else
-  inf "- agent disabled (AGENT_ENABLED=false)"
+  bad "/api/chat returned nothing for the coding prompt"
 fi
+rm -f "$C"
 
 hdr "6 · UI"
-curl -sf "$UI" >/dev/null && ok "frontend on ${UI} (tabs: Chat · Carbon · Observability · Agent)" || bad "frontend down"
+curl -sf "$UI" >/dev/null && ok "frontend on ${UI} (tabs: Chat · Carbon · Observability · Models)" || bad "frontend down"
 
 printf '\n'
 [[ "$FAIL" -eq 0 ]] && printf '\033[32mDeployment verified.\033[0m\n' \

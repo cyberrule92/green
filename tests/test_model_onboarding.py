@@ -12,7 +12,10 @@ things this module talks to, and both are passed in or stubbed.
 """
 from __future__ import annotations
 
+import io
 import json
+import pathlib
+import tarfile
 
 import pytest
 
@@ -643,3 +646,93 @@ def test_sidecar_free_is_taken_as_reported_not_recomputed(monkeypatch, tmp_path)
     )
     assert res.vram_free_mb == 6660.0
     assert res.vram_budget_mb == 6660.0 - 1024.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Quantized artifacts
+#
+# A quantized checkpoint is a deliverable on its own, separate from the routing
+# decision. These pin the two things that make that safe: the artifact id reaches
+# a filesystem path from an HTTP route, and a directory left behind by a failed
+# pass must not be handed out as a working checkpoint.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_artifact(service, name: str, *, complete: bool = True, meta: dict | None = None):
+    d = pathlib.Path(service.cache_dir) / "quantized" / name
+    d.mkdir(parents=True, exist_ok=True)
+    if complete:
+        (d / "config.json").write_text(json.dumps({"quantization_config": {"quant_method": "awq"}}))
+        (d / "model.safetensors").write_bytes(b"weights" * 100)
+    (d / mo.ARTIFACT_META_FILE).write_text(json.dumps(meta or {"source_repo_id": "org/model"}))
+    return d
+
+
+def test_quantized_artifact_is_listed_without_entering_the_zoo(service):
+    _make_artifact(service, "q-model")
+    arts = service.list_artifacts()
+    assert [a["artifact_id"] for a in arts] == ["q-model"]
+    assert arts[0]["in_zoo"] is False
+    assert arts[0]["complete"] is True
+    assert arts[0]["source_repo_id"] == "org/model"
+    # The routing registry is untouched: quantizing is not onboarding.
+    assert service.zoo.get_model("q-model") is None
+
+
+def test_container_path_is_reported_not_the_api_local_one(service):
+    """The two paths are the same bytes; only the container one is servable."""
+    _make_artifact(service, "q-model")
+    art = service.get_artifact("q-model")
+    assert art["container_path"] == "/root/.cache/huggingface/quantized/q-model"
+    assert str(service.artifact_local_path("q-model")).endswith("/quantized/q-model")
+
+
+def test_incomplete_artifact_is_flagged_and_refuses_to_download(service):
+    _make_artifact(service, "half-written", complete=False)
+    assert service.get_artifact("half-written")["complete"] is False
+    with pytest.raises(ValueError, match="incomplete"):
+        service.stream_artifact("half-written")
+
+
+def test_artifact_id_cannot_escape_the_quantized_directory(service):
+    for evil in ("../../etc", "..", "/etc/passwd", "a/b", ""):
+        with pytest.raises(ValueError):
+            service.get_artifact(evil)
+
+
+def test_download_streams_a_tar_containing_the_checkpoint(service):
+    _make_artifact(service, "q-model")
+    filename, chunks = service.stream_artifact("q-model")
+    assert filename == "q-model.tar"
+    blob = b"".join(chunks)
+    names = tarfile.open(fileobj=io.BytesIO(blob)).getnames()
+    assert "q-model/config.json" in names
+    assert "q-model/model.safetensors" in names
+
+
+def test_deleting_an_artifact_the_zoo_still_routes_to_is_refused(service):
+    _make_artifact(service, "q-model")
+    service.zoo.register_model({"id": "q-model", "available": True})
+    with pytest.raises(ValueError, match="registered"):
+        service.delete_artifact("q-model")
+
+
+def test_quantize_only_run_cannot_also_ask_to_be_served(service):
+    """Serving means routing, and routing means a zoo entry."""
+    with pytest.raises(ValueError, match="auto_serve"):
+        service.start("org/model", auto_serve=True, register=False)
+
+
+def test_download_streams_lazily_rather_than_buffering_the_whole_shard(service):
+    """A weight shard is gigabytes; the generator must not materialise one.
+
+    tarfile writes a member in a single add() call, so a fileobj that merely
+    accumulates would hold the entire shard in memory before the consumer got a
+    byte. Taking one chunk and stopping proves the pipe is doing the work.
+    """
+    d = _make_artifact(service, "q-model")
+    (d / "model.safetensors").write_bytes(b"\xa5" * (5 * 1024 * 1024))
+    _filename, chunks = service.stream_artifact("q-model")
+    first = next(chunks)
+    assert 0 < len(first) <= 1024 * 1024
+    chunks.close()  # a client hanging up mid-download must not raise

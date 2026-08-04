@@ -6,10 +6,18 @@ services:
       - --host=0.0.0.0
       - --port=8001
       # 0.12, not 0.25: TinyLlama-1.1B is ~2.2 GB of fp16 weights, so a quarter of
-      # a 24 GB slice was ~5 GB of KV cache this model cannot use at 2048 ctx. The
-      # reclaimed headroom is what lets the agent's coder-7b escalation rung fit.
+      # a 24 GB slice was ~5 GB of KV cache this model cannot use at 2048 ctx.
       - --gpu-memory-utilization=0.12
       - --max-model-len=2048
+      # Pin the KV pool. --gpu-memory-utilization is NOT a cap: vLLM sizes the
+      # pool off memory that is *free when this engine boots*, so the footprint
+      # depends on who started first. On 2026-08-04 a vGPU licence lapse put all
+      # four engines into a simultaneous restart loop; whichever won the race
+      # profiled against an empty slice and ballooned, and the losers then saw
+      # negative headroom and refused to start ("Free memory ... is less than
+      # desired GPU memory utilization"). 363 blocks x 16 = 5,808 tokens is the
+      # size this engine took on the last all-healthy boot (2026-07-30).
+      - --num-gpu-blocks-override=363
     environment:
       - HF_TOKEN=${HF_TOKEN:-}
     volumes:
@@ -45,8 +53,7 @@ services:
       - --host=0.0.0.0
       - --port=8002
       # 0.20, not 0.22: at 0.22 vLLM allocated a 132,608-token KV cache for a
-      # 4096-token context — far more than this model can address. Trimming the
-      # surplus helps the agent's coder-7b rung fit on a 24 GB slice.
+      # 4096-token context — far more than this model can address.
       # Do NOT go below ~0.19: at 0.16 there is no room left for cache blocks
       # after the weights and vLLM refuses to start ("No available memory for the
       # cache blocks"), which takes the chat path down with it.
@@ -57,7 +64,6 @@ services:
       # KV cache for a 4096-token context — 36x what this model can address, and
       # ~4.3 GB of pure waste. 2048 blocks x 16 tokens = 32,768 tokens = 8
       # concurrent full-length sequences, which is far more than this app runs.
-      # Reclaiming that surplus is what lets the agent's coder-7b rung fit.
       - --num-gpu-blocks-override=2048
     environment:
       - HF_TOKEN=${HF_TOKEN:-}
@@ -270,13 +276,14 @@ services:
       - --host=0.0.0.0
       - --port=8006
       - --gpu-memory-utilization=0.18
-      # 4096, not 2048: this is the coding agent's first rung, and its repair
-      # prompt carries the task + current files + the failing test output. At
-      # 2048 that prompt overflows, vLLM 400s, and run_vllm_inference silently
-      # escalates — so the repair loop would never actually run on the coder.
-      # 4096 is sufficient (and 8192 is not worth its KV cost): coding_agent caps
-      # the repair prompt at ~3000 chars of files + 2000 of test output, so the
-      # worst case is ~1900 input + 2048 output tokens.
+      # Pin the KV pool so this engine's footprint does not depend on boot
+      # order — see the note on vllm-medium. 557 blocks x 16 = 8,912 tokens,
+      # the size taken on the last all-healthy boot (2026-07-30).
+      - --num-gpu-blocks-override=557
+      # 4096, not 2048: this is the single coding model for the whole deployment,
+      # and a coding prompt carries the task plus the surrounding source context.
+      # At 2048 that overflows, vLLM 400s, and run_vllm_inference silently
+      # escalates to a general instruct model. 8192 is not worth its KV cost.
       - --max-model-len=4096
     environment:
       - HF_TOKEN=${HF_TOKEN:-}
@@ -303,59 +310,6 @@ services:
       # Above the script's own 5s + 25s worst case.
       timeout: 35s
       start_period: 60s
-      retries: 5
-    restart: unless-stopped
-
-  # Escalation rung for the agentic coding harness (coding_agent.py).
-  #
-  # NOT the MoE. vllm-moe serves Qwen3-30B-A3B — ~60 GB of fp16 weights, which
-  # cannot load on a 24 GB vGPU slice at any --gpu-memory-utilization. On this
-  # hardware the honest strongest-code-model escalation is a 4-bit AWQ 7B from
-  # the same Qwen-Coder family: strictly better at code than the 1.5B rung
-  # below it, and it actually fits (~5.5 GB of weights).
-  #
-  # Only started for agent work (profile "agent"); the chat path never uses it.
-  vllm-coder-7b:
-    profiles: ["agent"]
-    image: vllm/vllm-openai:latest
-    command:
-      - --model=Qwen/Qwen2.5-Coder-7B-Instruct-AWQ
-      - --host=0.0.0.0
-      - --port=8009
-      - --quantization=awq
-      # Budget on a 24 GB slice with medium(0.12) + full(0.20, KV-capped) +
-      # coder-1.5b(0.18) already resident, which leaves ~8.1 GiB.
-      # 0.32 of 23.79 GiB = 7.6 GiB: the AWQ weights are 4.85 GiB, so anything
-      # below ~0.28 leaves no room for cache blocks and vLLM refuses to start.
-      # Raising it much past 0.32 will OOM against the resident chat stack.
-      - --gpu-memory-utilization=0.32
-      - --max-model-len=4096
-    environment:
-      - HF_TOKEN=${HF_TOKEN:-}
-    volumes:
-      - ./data/hf-cache:/root/.cache/huggingface
-      - ./scripts/vllm_healthcheck.py:/healthcheck.py:ro
-    ports:
-      - "8009:8009"
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-    shm_size: "4gb"
-    healthcheck:
-      # Generates one token. `/health` returns 200 from a wedged engine —
-      # that state went undetected for 21 hours on 2026-07-29 and took the
-      # whole API down with it. See scripts/vllm_healthcheck.py.
-      test: ["CMD", "python3", "/healthcheck.py", "8009"]
-      # Slower than the old 20s poll because this one costs a token.
-      interval: 60s
-      # Above the script's own 5s + 25s worst case.
-      timeout: 35s
-      # First boot downloads ~5.5 GB of weights.
-      start_period: 600s
       retries: 5
     restart: unless-stopped
 
@@ -453,18 +407,6 @@ services:
       VLLM_STEM_SCIENCE_URL: ${VLLM_STEM_SCIENCE_URL:-http://vllm-stem-science:8005/v1}
       VLLM_STEM_CODING_URL: ${VLLM_STEM_CODING_URL:-http://vllm-stem-coding:8006/v1}
       VLLM_FALLBACK_URL: ${VLLM_FALLBACK_URL:-http://vllm-fallback:8007/v1}
-      # Escalation rung for the coding agent (profile "agent"). When the
-      # container is down the harness detects it via _is_vllm_live and reports
-      # escalation_unavailable rather than silently falling back to a general model.
-      VLLM_CODER7B_URL: ${VLLM_CODER7B_URL:-http://vllm-coder-7b:8009/v1}
-      # Agentic coding harness. AGENT_DEFER_CI defaults to 600 for EMAP_ZONE=IN-WE:
-      # that grid sits ~480-560 gCO2/kWh, so the 400 used elsewhere would defer
-      # every agent task forever.
-      AGENT_ENABLED: ${AGENT_ENABLED:-true}
-      AGENT_DEFER_CI: ${AGENT_DEFER_CI:-600}
-      AGENT_CARBON_BUDGET_G: ${AGENT_CARBON_BUDGET_G:-30.0}
-      AGENT_ATTEMPTS_PER_TIER: ${AGENT_ATTEMPTS_PER_TIER:-2}
-      AGENT_LADDER: ${AGENT_LADDER:-}
       # LLM safety classifier (guardrail rail I.9). Backed by the dedicated
       # Llama Guard 3 container; fails open if unreachable. GUARDRAILS_LLM_MODE
       # auto-detects the Llama Guard prompt/response format from the model name.

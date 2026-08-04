@@ -51,25 +51,59 @@ HF_IMAGE_FALLBACK_ENABLED = os.getenv("HF_IMAGE_FALLBACK_ENABLED", "true").lower
 HF_INFERENCE_BASE = os.getenv(
     "HF_INFERENCE_BASE", "https://router.huggingface.co/hf-inference/models"
 ).rstrip("/")
-# FLUX.1-schnell is Apache-2.0, fast (few-step distilled) and reliably served on
-# the hf-inference provider. Overridable per diffusion variant.
-_HF_DEFAULT_IMAGE_MODEL = os.getenv("HF_IMAGE_MODEL", "black-forest-labs/FLUX.1-schnell")
+# Which model to ask for. This is *not* a free choice: the hf-inference provider
+# serves a small and shrinking set, and asking for one it has dropped returns
+# HTTP 410 ("model is deprecated and no longer supported by provider"), which the
+# caller can only turn into a placeholder.
+#
+# 2026-07-30: that is exactly what happened. The previous default,
+# FLUX.1-schnell, started 410-ing and every image silently became a placeholder.
+# At that point the provider listed *one* text-to-image model, the one below.
+# Before changing this, check what is actually served rather than guessing:
+#
+#   GET https://huggingface.co/api/models
+#       ?pipeline_tag=text-to-image&inference_provider=hf-inference
+#
+# Both diffusion variants therefore resolve to the same upstream model unless
+# HF_SDXL_MODEL / HF_FLUX_MODEL override them. The zoo still ranks them as two
+# candidates with different step budgets and carbon profiles; the *returned*
+# model id is the real one, so the response says which model actually ran rather
+# than echoing the candidate's name back.
+_HF_DEFAULT_IMAGE_MODEL = os.getenv("HF_IMAGE_MODEL", "stabilityai/stable-diffusion-3-medium-diffusers")
 _HF_IMAGE_MODEL_BY_VARIANT = {
     "diffusion-sdxl": os.getenv("HF_SDXL_MODEL", _HF_DEFAULT_IMAGE_MODEL),
-    "diffusion-flux": os.getenv("HF_FLUX_MODEL", "black-forest-labs/FLUX.1-schnell"),
+    "diffusion-flux": os.getenv("HF_FLUX_MODEL", _HF_DEFAULT_IMAGE_MODEL),
 }
-# Distilled few-step models ignore large step counts; clamp what we pass so the
-# carbon-capped step budget still modulates the request within the useful range.
-HF_IMAGE_MAX_STEPS = int(os.getenv("HF_IMAGE_MAX_STEPS", "8"))
+# Ceiling on the steps passed upstream. This used to be 8, because the old
+# default was a few-step distilled model that ignored anything higher. SD3-medium
+# is not distilled, and an 8-step ceiling would both look poor and defeat the
+# point of the carbon control: `carbon_capped_diffusion_steps` already ramps
+# 30 → 10 as grid intensity rises, and a ceiling below that floor would pin every
+# request to the same value whatever the grid was doing. Keep this at or above
+# the zoo's largest `diffusion_min_steps` so the ramp stays the thing in charge.
+HF_IMAGE_MAX_STEPS = int(os.getenv("HF_IMAGE_MAX_STEPS", "28"))
 HF_READ_TIMEOUT = float(os.getenv("HF_READ_TIMEOUT", "120"))  # cold starts can be slow
 
 
 def _hf_generate_image(
     variant: str, prompt: str, steps: int, width: int, height: int
-) -> tuple[bytes, str] | None:
-    """Return (png_bytes, hf_model_id) from the HF Inference router, or None."""
-    if not (HF_IMAGE_FALLBACK_ENABLED and HF_TOKEN):
-        return None
+) -> tuple[bytes | None, str, str]:
+    """Generate via the HF Inference router.
+
+    Returns ``(png_bytes, hf_model_id, reason)``. On success ``png_bytes`` is set
+    and ``reason`` is empty; on failure ``png_bytes`` is None and ``reason`` says
+    what went wrong, in words a person can act on.
+
+    The reason is returned rather than only logged because this function failing
+    is invisible from the outside — the user just gets a placeholder. On
+    2026-07-30 the upstream model started returning 410 and every image quietly
+    became a placeholder; the log line existed but was not surfaced anywhere the
+    operator would look.
+    """
+    if not HF_IMAGE_FALLBACK_ENABLED:
+        return None, "", "HF image fallback disabled (HF_IMAGE_FALLBACK_ENABLED)"
+    if not HF_TOKEN:
+        return None, "", "no HF_TOKEN configured, so the hosted fallback cannot authenticate"
     model = _HF_IMAGE_MODEL_BY_VARIANT.get((variant or "").lower(), _HF_DEFAULT_IMAGE_MODEL)
     payload = {
         "inputs": prompt or "an image",
@@ -91,12 +125,25 @@ def _hf_generate_image(
                           timeout=(_CONNECT_TIMEOUT + 2, HF_READ_TIMEOUT))
         ctype = r.headers.get("content-type", "")
         if r.status_code == 200 and ctype.startswith("image"):
-            return r.content, model
-        logger.warning("HF image-gen non-image (%s, %s): %s",
-                       r.status_code, ctype, r.text[:160] if not ctype.startswith("image") else "")
+            return r.content, model, ""
+        body = r.text[:200] if not ctype.startswith("image") else ""
+        logger.warning("HF image-gen non-image (%s, %s): %s", r.status_code, ctype, body)
+        if r.status_code == 410:
+            # The specific failure that broke this in July 2026. Name the remedy,
+            # because "410" alone sends the reader to the wrong place.
+            return None, model, (
+                f"{model} is no longer served by the hf-inference provider (HTTP 410). "
+                "Set HF_IMAGE_MODEL to one it still serves — list them with "
+                "pipeline_tag=text-to-image&inference_provider=hf-inference on /api/models"
+            )
+        if r.status_code in (401, 403):
+            return None, model, f"HF rejected the token for {model} (HTTP {r.status_code})"
+        if r.status_code == 429:
+            return None, model, f"HF rate-limited this token (HTTP 429) for {model}"
+        return None, model, f"HF returned {r.status_code} ({ctype or 'no content-type'}) for {model}: {body}"
     except Exception as exc:
         logger.warning("HF image-gen call failed: %s", exc)
-    return None
+        return None, model, f"HF request to {model} failed: {type(exc).__name__}: {exc}"
 
 
 # ── Endpoint resolution ───────────────────────────────────────────────────────
@@ -229,20 +276,26 @@ def run_image_generation(
             logger.warning("NIM image-gen call failed (%s); trying HF", exc)
 
     # ── Real image via Hugging Face Inference (no local NIM) ──
-    hf = _hf_generate_image(candidate.get("model_variant") or "", prompt, steps, width, height)
-    if hf:
-        png_bytes, hf_model = hf
+    png_bytes, hf_model, hf_reason = _hf_generate_image(
+        candidate.get("model_variant") or "", prompt, steps, width, height
+    )
+    if png_bytes:
         b64 = base64.b64encode(png_bytes).decode("ascii")
         return {
             "image_data_uri": f"data:image/png;base64,{b64}",
             "backend": "huggingface", "model": hf_model, "steps": min(steps, HF_IMAGE_MAX_STEPS),
             "width": width, "height": height,
             "actual_latency_ms": (time.monotonic() - start) * 1000.0,
+            # The model that actually ran, which is not always the candidate the
+            # router picked — the provider serves a narrow set.
             "note": f"Hugging Face Inference · {hf_model}",
         }
 
-    reason = ("no NIM endpoint, HF unavailable → placeholder" if not url
-              else "NIM error, HF unavailable → placeholder")
+    # Carry the upstream reason instead of a generic "unavailable". A placeholder
+    # is a visible symptom with an invisible cause; this is where the cause gets
+    # attached to it.
+    prefix = "no NIM endpoint" if not url else "NIM error"
+    reason = f"{prefix}; {hf_reason or 'HF unavailable'} → placeholder"
     return {
         "image_data_uri": _placeholder_image_data_uri(prompt, model_name, steps, width, height, reason),
         "backend": "fallback", "model": model_name, "steps": steps,

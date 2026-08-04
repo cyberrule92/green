@@ -9,6 +9,8 @@ This project now implements the architecture from the attached Adaptive Green AI
 - Ubuntu vGPU deployment path around Triton, the API, the metrics sidecar, and the frontend
 - Optional HTTPS edge for real browser-safe production access behind a DNS hostname
 - Model onboarding: browse Hugging Face, size a quantization plan against the VRAM actually free, download, serve and register new routing candidates — which stay unavailable to the router until measured
+- Carbon-aware fine-tuning: LoRA/QLoRA runs scheduled into the cleanest window in the 48-hour grid forecast, metered against sampled carbon intensity, with a requests-to-break-even payback figure
+- Quantize without onboarding: run an AWQ pass and download the resulting checkpoint as a tarball, with no model-zoo entry and nothing exposed to the router
 
 ## Main services
 
@@ -17,6 +19,7 @@ This project now implements the architecture from the attached Adaptive Green AI
 - `routing_policies.py`: tier policies, candidate ranking, and EcoServe-style routing signals
 - `conversation_store.py`: persistent conversation storage in SQLite
 - `model_onboarding.py`: Hugging Face browse/quantize/serve/register pipeline behind `/api/models`
+- `finetuning.py`: carbon-scheduled LoRA/QLoRA fine-tuning from collected feedback, behind `/api/finetune`
 - `frontend/`: HPE chat UI with architecture and knowledge-base panels
 
 ## Ubuntu vGPU deployment
@@ -37,6 +40,33 @@ Copy `.env.example` to `.env` and set `EMAP_TOKEN` if you want live grid-carbon 
 ```bash
 docker compose -f docker-compose.ubuntu-vgpu.yml --env-file .env up --build -d
 ```
+
+### 2b. Quantization and fine-tuning (opt-in)
+
+Both run in their own GPU containers — the API image cannot do either, since its
+torch targets CUDA 13 against this host's 12.8 driver. Build the two runner
+images first; each derives from `vllm/vllm-openai:latest`, which is already
+pulled, so they add roughly a gigabyte rather than a fresh multi-GB torch:
+
+```bash
+docker build -f docker/quantize/Dockerfile -t green-quantize:latest .
+docker build -f docker/finetune/Dockerfile -t green-finetune:latest .
+```
+
+Then bring the stack up with both overlays. The onboarding overlay is required
+for either — both need the Docker socket to launch their runner, which is
+root-equivalent on the host, hence the separate opt-in file:
+
+```bash
+docker compose -f docker-compose.ubuntu-vgpu.yml \
+               -f docker-compose.onboarding.yml \
+               -f docker-compose.finetune.yml \
+               --env-file .env up --build -d
+```
+
+Both surface on the **Models** tab: quantize a model and download the checkpoint,
+or train a LoRA adapter on collected up-votes and watch it wait for a clean grid
+window. Neither result is routable until measured figures are posted for it.
 
 ### 3. Endpoints
 

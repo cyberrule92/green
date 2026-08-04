@@ -79,9 +79,8 @@ IMAGES = [
     ("node:20-alpine (build only)", 0.19, "discarded after build"),
 ]
 WEIGHTS = [
-    ("Qwen2.5-Coder-7B-Instruct-AWQ", 5.32, "agent"),
     ("Qwen2.5-Math-1.5B-Instruct", 2.96, "stem"),
-    ("Qwen2.5-Coder-1.5B-Instruct", 2.96, "agent / stem-coding"),
+    ("Qwen2.5-Coder-1.5B-Instruct", 2.96, "stem-coding"),
     ("Qwen2.5-1.5B-Instruct", 2.96, "base"),
     ("meta-llama/Llama-Guard-3-1B", 2.87, "guard (gated)"),
     ("TinyLlama-1.1B-Chat-v1.0", 2.10, "base"),
@@ -93,7 +92,6 @@ SERVICES = [
     ("vllm-full", 8002, "Qwen2.5-1.5B-Instruct", 0.20, "(default)"),
     ("vllm-guard", 8008, "Llama-Guard-3-1B", 0.25, "(default)"),
     ("vllm-stem-coding", 8006, "Qwen2.5-Coder-1.5B", 0.18, "stem, stem-coding"),
-    ("vllm-coder-7b", 8009, "Qwen2.5-Coder-7B-AWQ", 0.32, "agent"),
     ("vllm-stem-math", 8004, "Qwen2.5-Math-1.5B", 0.20, "stem, stem-math"),
     ("vllm-moe", 8003, "Qwen3-30B-A3B (MoE)", 0.90, "moe"),
     ("vllm-fallback", 8007, "Llama-2-7b-chat (CPU)", 0.0, "fallback"),
@@ -109,7 +107,7 @@ def chart_vram_budget() -> Path:
 
     # The stack this deployment actually runs, in start order.
     running = [("vllm-medium", 0.12, GREEN), ("vllm-full", 0.20, GREEN_D),
-               ("vllm-stem-coding", 0.18, GREEN), ("vllm-coder-7b", 0.32, AMBER)]
+               ("vllm-stem-coding", 0.18, GREEN)]
     left = 0.0
     for name, frac, col in running:
         gb = frac * VRAM_TOTAL_GB
@@ -141,7 +139,7 @@ def chart_vram_budget() -> Path:
             ha="right", fontsize=7.8, color=RED, fontweight="bold")
 
     ax.set_yticks([1, 0.35])
-    ax.set_yticklabels(["base + agent\n(this deployment)", "…plus the guard\nrung"],
+    ax.set_yticklabels(["base + coding rung\n(this deployment)", "…plus the guard\nrung"],
                        fontsize=8)
     ax.set_xlabel("VRAM (GB) — allocated by --gpu-memory-utilization, not by demand")
     ax.set_xlim(0, 30)
@@ -200,7 +198,7 @@ def diagram_deploy_flow() -> Path:
         (0.52, "deploy/bootstrap.sh", "≈ 30 min first run",
          "seed .env · detect GPU\nbuild · pull 19 GB · up", GREEN_D),
         (0.77, "deploy/verify.sh", "≈ 2 min",
-         "routes green? grid live?\naudit signed? agent completes?", BLUE),
+         "routes green? grid live?\naudit signed? coding routes?", BLUE),
     ]
     for x, title, sub, body, col in steps:
         # Empty label: _box centres its own label, and we want a title/sub/body
@@ -321,7 +319,7 @@ def build():
         "\n"
         "deploy/preflight.sh                 # refuses to proceed on a real fault\n"
         "cp deploy/env.template .env         # then paste the 4 secrets from Appendix A\n"
-        "deploy/bootstrap.sh agent stem-coding\n"
+        "deploy/bootstrap.sh stem-coding\n"
         "deploy/verify.sh\n"
         "\n"
         "# UI  http://localhost:8080     API  http://localhost:8100"))
@@ -350,8 +348,8 @@ def build():
         [cell("<b>Resource</b>"), cell("<b>Minimum</b>"), cell("<b>Reference box</b>"), cell("<b>Why</b>")],
         [cell("<b>GPU</b>"), cell("NVIDIA, 16 GB VRAM"), cell("H100L-2-24C vGPU, 24 GB"),
          cell("vLLM reserves its VRAM fraction up front, so the ceiling is hard. See §2.")],
-        [cell("<b>VRAM</b>"), cell("16 GB (base only)<br/>24 GB (base + agent)"), cell("24 576 MiB"),
-         cell("Base stack = 8.0 GB. The agent's 7B escalation rung adds 7.9 GB.")],
+        [cell("<b>VRAM</b>"), cell("16 GB (base only)<br/>24 GB (base + coding)"), cell("24 576 MiB"),
+         cell("Base stack = 8.0 GB. The Coder-1.5B rung adds 4.4 GB.")],
         [cell("<b>Disk</b>"), cell("65 GB free"), cell("243 GB (97 GB free)"),
          cell("41.9 GB images + 19.2 GB weights, before build cache.")],
         [cell("<b>RAM</b>"), cell("16 GB"), cell("—"),
@@ -426,9 +424,9 @@ def build():
     ], [62 * mm, 108 * mm]))
     E.append(P(
         "There is no other egress. The guardrails have no external LLM dependency, the RL "
-        "controller trains in-process, and LangSmith/LangChain tracing is force-disabled at "
-        "import in <font face='Courier'>coding_agent.py</font> — langchain-core pulls langsmith, "
-        "which would otherwise POST your prompts off-box from an on-prem deployment.", "body"))
+        "controller trains in-process, and no LangChain/LangSmith package is installed at all — "
+        "langchain-core pulls langsmith, which would otherwise POST your prompts off-box from an "
+        "on-prem deployment.", "body"))
 
     E.append(PageBreak())
 
@@ -438,10 +436,10 @@ def build():
         "Disk is cheap and CPU is idle. VRAM is what decides which profiles you can run at "
         "the same time, because vLLM does not allocate on demand — each container reserves "
         "<font face='Courier'>--gpu-memory-utilization × total</font> at startup and holds it. "
-        "Four containers at 0.12 + 0.20 + 0.18 + 0.32 do not compete for memory; they simply "
-        "claim 82 % of the card and leave.", "body"))
+        "Three containers at 0.12 + 0.20 + 0.18 do not compete for memory; they simply "
+        "claim 50 % of the card and leave.", "body"))
     E.append(img(d_vram, 176 * mm))
-    E.append(caption("Measured: 21 110 MiB of 24 576 MiB in use with the base + agent stack up. "
+    E.append(caption("Measured: 13 127 MiB of 24 576 MiB in use with the base + coding stack up. "
                      "The guard container cannot be added on a 24 GB card — that is not a bug, "
                      "it is arithmetic, and it is why <font face='Courier'>GUARDRAILS_LLM_CLASSIFIER_ENABLED=false</font> "
                      "in the shipped .env."))
@@ -453,8 +451,8 @@ def build():
         for s, p, m, u, pr in SERVICES
     ], [30 * mm, 13 * mm, 43 * mm, 23 * mm, 17 * mm, 44 * mm]))
     E.append(P(
-        "<b>Rules of thumb.</b> On a 24 GB card you can run the base stack plus the agent, or "
-        "the base stack plus the guard, but not all three. The MoE profile "
+        "<b>Rules of thumb.</b> On a 24 GB card the base stack plus the coding rung leaves room "
+        "for the guard; adding the MoE does not fit. The MoE profile "
         "(<font face='Courier'>Qwen3-30B-A3B</font>, 0.90) needs the card to itself. If a container "
         "exits immediately with a CUDA OOM, you have over-committed — lower a fraction or drop a "
         "profile; do not raise <font face='Courier'>--gpu-memory-utilization</font> hoping it fits.",
@@ -517,7 +515,7 @@ def build():
         "until <font face='Courier'>/health/ready</font> answers.", "body"))
     E.append(code(
         "deploy/bootstrap.sh                    # base stack only\n"
-        "deploy/bootstrap.sh agent stem-coding  # + the coding agent's two rungs  ← this deployment\n"
+        "deploy/bootstrap.sh stem-coding        # + the Coder-1.5B rung  ← this deployment\n"
         "deploy/bootstrap.sh moe                # the 30B MoE — needs the whole card"))
 
     E.append(P("3.3 verify.sh — proves the four claims", "h2"))
@@ -525,9 +523,9 @@ def build():
         "A green health check proves nothing about a carbon router, which is why this script exists. "
         "It asserts that a greeting routes to the <i>smallest</i> rung and not the largest; that the "
         "grid signal is <font face='Courier'>live</font> rather than the fallback constant; that the "
-        "audit log is accumulating signed rows; and that the agent completes a real coding task "
-        "against a caller-supplied frozen spec, reporting the rung it finished on and the carbon it "
-        "took to get there.", "body"))
+        "audit log is accumulating signed rows; and that a real coding request reaches the coding "
+        "rung rather than a general instruct model, reporting the rung it landed on and the carbon "
+        "it took to get there.", "body"))
 
     E.append(PageBreak())
 
@@ -543,7 +541,7 @@ def build():
         "  ✓ API ready (the metrics sidecar answered — /health/ready blocks on it)\n"
         "  ✓ metrics sidecar\n"
         "  ✓ vLLM :8001 live      ✓ vLLM :8002 live\n"
-        "  ✓ vLLM :8006 live      ✓ vLLM :8009 live\n"
+        "  ✓ vLLM :8006 live\n"
         "\n"
         "2 · Carbon-aware routing + live grid\n"
         "  ✓ \"hi\" routed to ultra-light (TinyLlama-1.1B-Chat-v1.0) — 0.000083 gCO2\n"
@@ -555,13 +553,10 @@ def build():
         "4 · Signed audit trail\n"
         "  ✓ decision_logs.jsonl: 403 HMAC-signed rows\n"
         "\n"
-        "5 · Agentic harness — carbon per successful completion\n"
-        "  ✓ agent COMPLETED\n"
-        "    rung             : Qwen2.5-Coder-1.5B\n"
-        "    escalated        : false      (the greenest rung was enough)\n"
-        "    LLM calls        : 1\n"
-        "    spec author      : caller     (your tests are the ground truth)\n"
-        "    gCO2 / completion: 0.0207\n"
+        "5 · Coding requests reach the coding rung\n"
+        "  ✓ coding prompt routed to stem-coding\n"
+        "    model            : Qwen2.5-Coder-1.5B-Instruct\n"
+        "    gCO2             : 0.0207\n"
         "\n"
         "6 · UI\n"
         "  ✓ frontend on http://localhost:8080\n"
@@ -570,9 +565,8 @@ def build():
     E.append(P(
         "Two of those lines are the product. <b>“hi” routed to ultra-light</b> means the router is "
         "choosing on carbon rather than defaulting to the biggest model — 0.000083 gCO₂ instead of "
-        "the ~0.0004 g the 1.5B would have cost for the same greeting. And <b>escalated: false</b> "
-        "means the agent finished a real coding task on the greenest code-capable rung without ever "
-        "waking the 7B.", "body"))
+        "the ~0.0004 g the 1.5B would have cost for the same greeting. And <b>routed to stem-coding</b> "
+        "means a coding request reached the code-capable rung instead of a general instruct model.", "body"))
     E.append(Paragraph(
         "The empty forecast is expected on the free Electricity Maps tier and is not a failure: "
         "deferral falls back to the live reading. It is called out rather than hidden because a "
@@ -595,16 +589,14 @@ def build():
          cell("<font face='Courier'>data/hf-cache</font> did not exist, so Docker created it root-owned and the container cannot write to it. <font face='Courier'>mkdir -p data/hf-cache</font> (bootstrap does this).")],
         [cell("<b>Every request routes to the biggest model</b>"),
          cell("The carbon signal is missing, so carbon scores are flat. Check <font face='Courier'>grid_signal.status == \"live\"</font> in a /api/chat response; if it says <font face='Courier'>fallback</font>, EMAP_TOKEN is wrong.")],
-        [cell("<b>Agent reports <font face='Courier'>escalation_unavailable</font></b>"),
-         cell("The 7B rung (<font face='Courier'>vllm-coder-7b</font>, :8009) is not up — you booted without the <font face='Courier'>agent</font> profile. The harness reports it rather than silently falling back to a general-purpose model.")],
-        [cell("<b>Agent burns its whole budget and fails</b>"),
-         cell("Almost always a model-authored spec that is well-formed but wrong. Pass your own <font face='Courier'>tests</font> in the POST body — the spec is then validated at submit (400 before any carbon is spent) and frozen. Measured: 2.98 g failing vs 0.028 g completing, on the same task.")],
+        [cell("<b>Coding prompts answer like a chat model</b>"),
+         cell("The Coder rung (<font face='Courier'>vllm-stem-coding</font>, :8006) is not up — you booted without the <font face='Courier'>stem-coding</font> profile, so coding requests fall through to the general instruct model.")],
         [cell("<b>Carbon numbers look implausible</b>"),
          cell("<font face='Courier'>GPU_TDP</font> / <font face='Courier'>GPU_VRAM_GB</font> in .env do not match the card. They feed the LLMCarbon formula directly. Nothing crashes — the books are just wrong. Bootstrap auto-detects VRAM; verify TDP by hand against the spec sheet.")],
         [cell("<b>Disk full mid-build</b>"),
          cell("<font face='Courier'>docker builder prune</font> first — the build cache is the reclaimable part. <font face='Courier'>data/hf-cache</font> is <i>not</i>: deleting it costs a 19 GB re-download.")],
         [cell("<b>Port already in use</b>"),
-         cell("Ports 8001-8009, 8080, 8100, 9000. If a <font face='Courier'>green-*</font> container holds it, the stack is already up: <font face='Courier'>docker compose ... down</font> first.")],
+         cell("Ports 8001-8008, 8080, 8100, 9000. If a <font face='Courier'>green-*</font> container holds it, the stack is already up: <font face='Courier'>docker compose ... down</font> first.")],
     ], [42 * mm, 128 * mm]))
 
     E.append(PageBreak())
@@ -615,7 +607,7 @@ def build():
     E.append(code(
         "C=\"docker compose -f docker-compose.ubuntu-vgpu.yml --env-file .env\"\n"
         "\n"
-        "$C --profile agent --profile stem-coding up --build -d   # start / rebuild\n"
+        "$C --profile stem-coding up --build -d                   # start / rebuild\n"
         "$C ps                                                    # what is running\n"
         "$C logs -f api                                           # follow the control plane\n"
         "$C restart api                                           # after an .env change\n"
@@ -623,8 +615,7 @@ def build():
         "\n"
         "curl localhost:8100/health/ready        # API (blocks on the metrics sidecar)\n"
         "curl localhost:9000/health              # sidecar\n"
-        "curl localhost:8009/health              # the agent's escalation rung\n"
-        "curl localhost:8100/api/agent/status    # ladder + per-rung live flags\n"
+
         "curl localhost:8100/api/queue/status    # deferred work\n"
         "curl localhost:8100/api/rl/status       # learned CSS weights per tier\n"
         "\n"
@@ -662,7 +653,7 @@ def build():
         [cell("<font face='Courier'>AUDIT_HMAC_KEY</font>"), cell("Rotate away from the shipped value. <font face='Courier'>openssl rand -hex 32</font>.")],
         [cell("<font face='Courier'>ALLOWED_ORIGINS</font>"), cell("Currently <font face='Courier'>http://localhost:8080</font>. Set to the real origin — it is the CORS allow-list.")],
         [cell("HTTPS"), cell("<font face='Courier'>PUBLIC_HOSTNAME=chat.example.com</font>, then add the Caddy overlay. It terminates TLS with an automatic certificate and reverse-proxies the frontend.")],
-        [cell("Ports"), cell("Only 8080 (UI) and 8100 (API) need to be reachable. Firewall 8001-8009 and 9000 — they are internal.")],
+        [cell("Ports"), cell("Only 8080 (UI) and 8100 (API) need to be reachable. Firewall 8001-8008 and 9000 — they are internal.")],
         ], [40 * mm, 130 * mm]),
     ]))
 
@@ -710,8 +701,6 @@ def build():
          cell("<b>Stale on the reference box, which has 24 GB.</b> bootstrap.sh now auto-detects and rewrites it.")],
         [cell("<font face='Courier'>EMAP_ZONE</font>"), cell("IN-WE"),
          cell("You are not on the India-West grid. E.g. US-CAL-CISO, DE, GB, FR.")],
-        [cell("<font face='Courier'>AGENT_DEFER_CI</font>"), cell("600"),
-         cell("Tuned for IN-WE, which sits at 480–560 gCO₂/kWh. On a cleaner grid the default 400 is right; on a dirty one, 400 defers every task forever.")],
         [cell("<font face='Courier'>GRID_CARBON_FALLBACK</font>"), cell("475"),
          cell("The number used when Electricity Maps is unreachable. Set it to your grid's annual average, not ours.")],
         [cell("<font face='Courier'>ALLOWED_ORIGINS</font>"), cell("localhost:8080"),

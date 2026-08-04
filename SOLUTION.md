@@ -471,7 +471,7 @@ Side-by-side with `SloCard`, contains two number inputs that round-trip the `slo
 | Component | Responsibility |
 |---|---|
 | `App.jsx` | Mounts `<Grommet>` with HPE-green theme |
-| `GreenAIChat.jsx` | Top-level shell: 5 tabs (Chat / Carbon / Observability / Coding Arena / Models) + chat composer + sidebar polling |
+| `GreenAIChat.jsx` | Top-level shell: 4 tabs (Chat / Carbon / Observability / Models) + chat composer + sidebar polling |
 | `ArchitecturePanel.jsx` | Static component diagram + RAG document manager |
 | `CarbonDashboard.jsx` | Real-time grid CI, system power, CO₂ trend, regional zones, queue status |
 | `RLPanel.jsx` | Per-tier weights, reward history sparkline, baseline EMA, policy-version transitions |

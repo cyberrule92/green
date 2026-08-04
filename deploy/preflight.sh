@@ -42,7 +42,7 @@ if command -v nvidia-smi >/dev/null; then
   if [[ "${GMEM:-0}" -ge 23000 ]]; then
     ok "VRAM: ${GMEM} MiB"
   elif [[ "${GMEM:-0}" -ge 15000 ]]; then
-    warn "VRAM: ${GMEM} MiB — enough for the base stack, NOT for the agent rung (see the VRAM budget in the deploy guide)"
+    warn "VRAM: ${GMEM} MiB — enough for the base stack, tight with the coding rung (see the VRAM budget in the deploy guide)"
   else
     bad "VRAM: ${GMEM} MiB — below the 16 GB floor; only the CPU fallback profile will run"
   fi
@@ -67,7 +67,7 @@ else bad "free space: ${AVAIL_G} GB — need ≥65 GB (33 GB vLLM image + 9 GB A
 hdr "Ports"
 # A port held by a green-* container is this stack already running, not a clash.
 MINE=$(docker ps --format '{{.Names}} {{.Ports}}' 2>/dev/null | grep '^green-' || true)
-for p in 8001 8002 8006 8009 8080 8100 9000; do
+for p in 8001 8002 8006 8080 8100 9000; do
   if ! ss -lntH "sport = :$p" 2>/dev/null | grep -q .; then
     ok "port $p free"
   elif grep -q ":$p->" <<<"$MINE"; then

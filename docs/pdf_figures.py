@@ -3,7 +3,7 @@ Figure generator for the Adaptive Green AI solution PDF.
 
 Every number plotted here is either read from the live config on disk
 (config/model_zoo.json, config/policies.json, data/rl_state.json) or is a value
-MEASURED on this deployment and recorded in MEASURED below. Nothing is invented;
+MEASURED on this deployment. Nothing is invented;
 where a curve is illustrative rather than measured it says so on the axes.
 
     python3 docs/pdf_figures.py     ->  docs/pdf_assets/*.png
@@ -51,30 +51,6 @@ plt.rcParams.update({
 CI_MEASURED = 518.0   # gCO2/kWh — grid_ci_avg over the last 24 h on this deployment
 
 
-# --------------------------------------------------------------------------
-# Measured on this deployment (see docs section "Measured results").
-# --------------------------------------------------------------------------
-MEASURED = {
-    # Same fizzbuzz task, same ladder, same models. Only the spec author differs.
-    "spec": {
-        "model_authored": {"carbon_g": 2.98, "calls": 4, "status": "failed", "escalated": True},
-        "caller_supplied": {"carbon_g": 0.028, "calls": 1, "status": "completed", "escalated": False},
-    },
-    # word_count: unsatisfiable model spec vs caller spec.
-    "word_count": {
-        "model_authored": {"carbon_g": 2.74, "calls": 4, "status": "failed"},
-        "caller_supplied": {"carbon_g": 0.045, "calls": 1, "status": "completed"},
-    },
-    # Before/after the seven harness correctness fixes (palindrome task).
-    "harness": {
-        "before": {"carbon_g": 32.8, "status": "failed (4x parse_failed, 2x backend timeout)"},
-        "after": {"carbon_g": 3.19, "status": "completed"},
-    },
-    # Broken verifier (test_command: nosuchbin) must abort, not escalate.
-    "harness_error": {"carbon_g": 0.20, "calls": 1, "escalated": False},
-}
-
-
 def _save(fig, name):
     path = OUT / name
     fig.savefig(path, dpi=200, bbox_inches="tight", facecolor="white")
@@ -116,145 +92,7 @@ def emb_carbon_g(m):
 
 
 # ==========================================================================
-# 1. The paradox: greenest per token is the dirtiest per completed task
-# ==========================================================================
-def fig_paradox():
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(9.4, 3.6))
-
-    zoo = {m["id"]: m for m in _zoo()}
-    small = zoo["local-vgpu-small"]
-    coder = zoo["local-vgpu-stem-coding"]
-    big = zoo["local-vgpu-coder-7b"]
-
-    names = ["DialoGPT-medium\n(0.35B)", "Qwen2.5-Coder\n1.5B", "Qwen2.5-Coder\n7B-AWQ"]
-    per_call = [op_carbon_g(small) * 1000, op_carbon_g(coder) * 1000, op_carbon_g(big) * 1000]
-
-    bars = ax1.bar(names, per_call, color=[GREEN, BLUE, AMBER], width=0.6)
-    ax1.set_ylabel("mgCO$_2$e per model call")
-    ax1.set_title("What CSS optimises: carbon per REQUEST", loc="left",
-                  fontsize=10, color=DARK, fontweight="bold")
-    for b, v in zip(bars, per_call):
-        ax1.text(b.get_x() + b.get_width() / 2, v, f"{v:.1f}", ha="center", va="bottom", fontsize=8)
-    ax1.annotate("greenest\nper call", xy=(0, per_call[0]), xytext=(0.15, max(per_call) * 0.72),
-                 fontsize=8, color=GREEN, fontweight="bold",
-                 arrowprops=dict(arrowstyle="->", color=GREEN, lw=1.2))
-    ax1.grid(axis="y", color=GRID, lw=0.7)
-    ax1.set_axisbelow(True)
-
-    # Right: carbon to actually FINISH a coding task.
-    names2 = ["DialoGPT-medium\n(cannot finish)", "Qwen2.5-Coder 1.5B\n+ verifier ladder"]
-    vals2 = [60.0, MEASURED["spec"]["caller_supplied"]["carbon_g"]]
-    colors2 = [RED, GREEN]
-    bars2 = ax2.bar(names2, vals2, color=colors2, width=0.6)
-    ax2.set_ylabel("gCO$_2$e per SUCCESSFUL completion")
-    ax2.set_title("What the agent optimises: carbon per COMPLETION", loc="left",
-                  fontsize=10, color=DARK, fontweight="bold")
-    ax2.text(0, 60.0, " burns the whole\n 60 g budget,\n delivers nothing", ha="center",
-             va="top", fontsize=8, color="white", fontweight="bold")
-    ax2.text(1, vals2[1], f"  {vals2[1]:.3f} g", ha="center", va="bottom", fontsize=8, color=GREEN,
-             fontweight="bold")
-    ax2.grid(axis="y", color=GRID, lw=0.7)
-    ax2.set_axisbelow(True)
-    ax2.set_ylim(0, 68)
-
-    fig.text(0.5, -0.06,
-             "The model that is greenest for one forward pass is the most expensive way to finish the job: "
-             "it cannot complete\nthe task, so it spends the entire step budget failing. An agent's unit of "
-             "work is a loop, not a call.",
-             ha="center", fontsize=8.5, color=SOFT, style="italic")
-    fig.tight_layout()
-    return _save(fig, "fig_paradox.png")
-
-
-# ==========================================================================
-# 2. Who authors the spec decides the carbon (measured)
-# ==========================================================================
-def fig_spec_authorship():
-    fig, ax = plt.subplots(figsize=(9.4, 3.9))
-
-    tasks = ["fizzbuzz", "word_count"]
-    model_g = [MEASURED["spec"]["model_authored"]["carbon_g"],
-               MEASURED["word_count"]["model_authored"]["carbon_g"]]
-    caller_g = [MEASURED["spec"]["caller_supplied"]["carbon_g"],
-                MEASURED["word_count"]["caller_supplied"]["carbon_g"]]
-
-    x = range(len(tasks))
-    w = 0.34
-    b1 = ax.bar([i - w / 2 for i in x], model_g, w, color=RED, label="Model-authored spec  →  FAILED")
-    b2 = ax.bar([i + w / 2 for i in x], caller_g, w, color=GREEN, label="Caller-supplied spec  →  COMPLETED")
-
-    for b, v in zip(b1, model_g):
-        ax.text(b.get_x() + b.get_width() / 2, v, f"{v:.2f} g\nwasted", ha="center", va="bottom",
-                fontsize=8, color=RED, fontweight="bold")
-    for b, v in zip(b2, caller_g):
-        ax.text(b.get_x() + b.get_width() / 2, v, f"{v:.3f} g\ncompleted", ha="center", va="bottom",
-                fontsize=8, color=GREEN, fontweight="bold")
-
-    ax.set_xticks(list(x))
-    ax.set_xticklabels(tasks, fontsize=10)
-    ax.set_ylabel("gCO$_2$e for the task")
-    ax.set_ylim(0, 3.9)
-    ax.legend(frameon=False, fontsize=8.5, loc="upper right")
-    ax.grid(axis="y", color=GRID, lw=0.7)
-    ax.set_axisbelow(True)
-    ax.set_title("Same task, same ladder, same models — only the spec author differs",
-                 loc="left", fontsize=11, color=DARK, fontweight="bold")
-
-    ax.annotate("106x", xy=(0 + w / 2, caller_g[0]), xytext=(0.06, 2.1),
-                fontsize=13, color=DARK, fontweight="bold",
-                arrowprops=dict(arrowstyle="-|>", color=DARK, lw=1.3,
-                                connectionstyle="arc3,rad=-0.3"))
-    ax.annotate("61x", xy=(1 + w / 2, caller_g[1]), xytext=(1.06, 1.9),
-                fontsize=13, color=DARK, fontweight="bold",
-                arrowprops=dict(arrowstyle="-|>", color=DARK, lw=1.3,
-                                connectionstyle="arc3,rad=-0.3"))
-
-    fig.text(0.02, -0.10,
-             "The frozen spec stops reward hacking. But when the LADDER'S WEAKEST RUNG authors it, a well-formed "
-             "but factually wrong spec\n"
-             "(fizzbuzz(0) == \"0\" — 0 is divisible by 3 and 5, so it must be \"FizzBuzz\") is unsatisfiable by "
-             "design: no correct implementation can\n"
-             "ever pass, the freeze forbids repairing it, and every rung burns its budget failing. "
-             "Caller-supplied tests remove the failure entirely.",
-             ha="left", fontsize=8.5, color=SOFT, style="italic")
-    fig.tight_layout()
-    return _save(fig, "fig_spec_authorship.png")
-
-
-# ==========================================================================
-# 3. Harness correctness fixes: before / after (measured)
-# ==========================================================================
-def fig_harness_fixes():
-    fig, ax = plt.subplots(figsize=(9.4, 3.4))
-
-    labels = ["Before fixes\n(palindrome)", "After fixes\n(palindrome)",
-              "Broken verifier\n(nosuchbin)"]
-    vals = [MEASURED["harness"]["before"]["carbon_g"],
-            MEASURED["harness"]["after"]["carbon_g"],
-            MEASURED["harness_error"]["carbon_g"]]
-    colors = [RED, GREEN, GREEN]
-    bars = ax.barh(labels, vals, color=colors, height=0.55)
-    ax.invert_yaxis()
-
-    notes = ["FAILED — 4x unparseable output, 2x backend timeout\nscored as verifier evidence, escalated on nothing",
-             "COMPLETED",
-             "ABORTED at rung 1, did NOT escalate\n(harness failure is not evidence about the model)"]
-    for b, v, n in zip(bars, vals, notes):
-        ax.text(v + 0.6, b.get_y() + b.get_height() / 2, f"{v} g   {n}",
-                va="center", fontsize=8.2, color=INK)
-
-    ax.set_xlabel("gCO$_2$e")
-    ax.set_xlim(0, 46)
-    ax.grid(axis="x", color=GRID, lw=0.7)
-    ax.set_axisbelow(True)
-    ax.set_title("Seven harness fixes: a task that wasted 32.8 g now completes for 3.2 g",
-                 loc="left", fontsize=11, color=DARK, fontweight="bold")
-    fig.tight_layout()
-    return _save(fig, "fig_harness_fixes.png")
-
-
-# ==========================================================================
-# 4. Routing candidate landscape (live model zoo)
+# 1. Routing candidate landscape (live model zoo)
 # ==========================================================================
 def fig_zoo_landscape():
     fig, ax = plt.subplots(figsize=(9.4, 4.6))
@@ -286,7 +124,7 @@ def fig_zoo_landscape():
 
 
 # ==========================================================================
-# 5. Operational + embodied carbon per request, per variant
+# 2. Operational + embodied carbon per request, per variant
 # ==========================================================================
 def fig_carbon_split():
     fig, ax = plt.subplots(figsize=(9.4, 3.8))
@@ -316,7 +154,7 @@ def fig_carbon_split():
 
 
 # ==========================================================================
-# 6. CSS tier weights (config) + what RL learned (live rl_state.json)
+# 3. CSS tier weights (config) + what RL learned (live rl_state.json)
 # ==========================================================================
 def fig_css_weights():
     pol = _policies()["tiers"]
@@ -371,7 +209,7 @@ def fig_css_weights():
 
 
 # ==========================================================================
-# 7. RL reward history (live rl_state.json)
+# 4. RL reward history (live rl_state.json)
 # ==========================================================================
 def fig_rl_learning():
     rl = _rl().get("tiers", {})
@@ -409,7 +247,7 @@ def fig_rl_learning():
 
 
 # ==========================================================================
-# 8. EcoServe deferral — carbon window (illustrative curve, labelled as such)
+# 5. EcoServe deferral — carbon window (illustrative curve, labelled as such)
 # ==========================================================================
 def fig_deferral():
     fig, ax = plt.subplots(figsize=(9.4, 3.4))
@@ -424,11 +262,11 @@ def fig_deferral():
 
     thresh = 600
     ax.axhline(thresh, color=RED, ls="--", lw=1.1)
-    ax.text(0.2, thresh + 8, "AGENT_DEFER_CI = 600 g/kWh", fontsize=8, color=RED)
+    ax.text(0.2, thresh + 8, "deferral threshold (HIGH_CARBON_THRESHOLD /\nFINETUNE_DEFER_CI) g/kWh", fontsize=8, color=RED)
 
     submit_h, dispatch_h = 19, 12
     ax.scatter([submit_h], [ci[submit_h]], s=70, color=RED, zorder=5)
-    ax.annotate("task submitted\n(grid dirty -> QUEUED,\nnot dropped)", (submit_h, ci[submit_h]),
+    ax.annotate("work submitted\n(grid dirty -> QUEUED,\nnot dropped)", (submit_h, ci[submit_h]),
                 textcoords="offset points", xytext=(-18, 18), fontsize=8, color=RED, ha="center")
 
     ax.scatter([dispatch_h + 24 - 24], [ci[dispatch_h]], s=70, color=GREEN, zorder=5)
@@ -439,7 +277,7 @@ def fig_deferral():
                 arrowprops=dict(arrowstyle="<|-", color=GREEN, lw=1.6,
                                 connectionstyle="arc3,rad=0.25"))
     ax.text((submit_h + dispatch_h) / 2, 175,
-            "AGENT_DEFERRAL_MS = 6 h budget\ncarbon billed at EXECUTION-time CI, not submit-time",
+            "bounded wait budget\ncarbon billed at EXECUTION-time CI, not submit-time",
             fontsize=8, color=GREEN, ha="center", fontweight="bold")
 
     ax.set_xlabel("hour of day (illustrative diurnal grid shape — live curve comes from Electricity Maps 48 h forecast)")
@@ -448,7 +286,7 @@ def fig_deferral():
     ax.set_ylim(150, 680)
     ax.grid(color=GRID, lw=0.7)
     ax.set_axisbelow(True)
-    ax.set_title("EcoServe deferral — the agent is the system's first real queue caller",
+    ax.set_title("EcoServe deferral — dirty-grid work waits for the greenest window",
                  loc="left", fontsize=10.5, color=DARK, fontweight="bold")
     fig.tight_layout()
     return _save(fig, "fig_deferral.png")
@@ -480,7 +318,7 @@ def _canvas(w=9.6, h=5.4):
 
 
 # ==========================================================================
-# 9. HLD — system architecture
+# 6. HLD — system architecture
 # ==========================================================================
 def diag_hld():
     fig, ax = _canvas(9.6, 6.4)
@@ -516,7 +354,7 @@ def diag_hld():
         ("rl_controller.py\nREINFORCE + EMA", 23.6),
         ("advanced_rag.py\nhybrid + rerank", 43.2),
         ("model_zoo.py\nLLMCarbon registry", 62.8),
-        ("coding_agent.py\nLangGraph ladder", 82.4),
+        ("model_onboarding.py\nquantize · serve · register", 82.4),
     ]
     for label, sx in sub:
         _box(ax, sx, 58, 15.6, 7.4, label, fc="white", ec=GRID, fs=6.8)
@@ -526,7 +364,7 @@ def diag_hld():
     # so the signal arrows below can reach the control plane without crossing a box.
     _box(ax, 6, 30, 41, 22, "", fc=LIGHT, ec=GRID)
     ax.text(7.5, 49.6, "INFERENCE PLANE (vLLM, OpenAI-compatible)", fontsize=7.6, color=DARK, fontweight="bold")
-    vllm = [("medium\n:8001", 7.5), ("full\n:8002", 17.3), ("stem-coding\n:8006", 27.1), ("coder-7b\n:8009", 36.9)]
+    vllm = [("medium\n:8001", 7.5), ("full\n:8002", 22.2), ("stem-coding\n:8006", 36.9)]
     for label, vx in vllm:
         _box(ax, vx, 40, 8.8, 7, label, fc="white", ec=BLUE, fs=6.8)
     _box(ax, 7.5, 31.5, 18.3, 6.5, "multimodal.py\nVLM + diffusion (NIM)", fc="white", ec=AMBER, fs=6.8)
@@ -578,7 +416,7 @@ def diag_hld():
 
 
 # ==========================================================================
-# 10. Workflow — request lifecycle
+# 7. Workflow — request lifecycle
 # ==========================================================================
 def diag_workflow():
     fig, ax = _canvas(9.6, 6.6)
@@ -639,7 +477,7 @@ def diag_workflow():
 
 
 # ==========================================================================
-# 11. LLD — CSS scoring funnel
+# 8. LLD — CSS scoring funnel
 # ==========================================================================
 def diag_css():
     fig, ax = _canvas(9.6, 5.0)
@@ -689,58 +527,7 @@ def diag_css():
 
 
 # ==========================================================================
-# 12. LLD — the LangGraph coding agent state machine
-# ==========================================================================
-def diag_agent():
-    fig, ax = _canvas(9.6, 5.6)
-
-    _box(ax, 3, 78, 22, 10, "node_generate\nwrite / repair files", fc="white", ec=BLUE, fs=8, bold=True)
-    _box(ax, 39, 78, 22, 10, "node_verify\nrun the frozen tests\nin a sandbox", fc="white", ec=DARK, fs=8, bold=True)
-    _box(ax, 75, 78, 22, 10, "classify()\npure router —\nsingle source of truth", fc="white", ec=GREEN, fs=7.5, bold=True)
-    _arrow(ax, (25, 83), (39, 83), color=SOFT, lw=1.4)
-    _arrow(ax, (61, 83), (75, 83), color=SOFT, lw=1.4)
-
-    # Outcomes
-    _box(ax, 3, 56, 26, 9, "passed  ->  COMPLETED\ncarbon_per_completion_g", fc="#E9F7F2", ec=GREEN, fs=7.5, bold=True)
-    _box(ax, 34, 56, 30, 9, "failed + attempts left\n->  repair on SAME rung", fc="white", ec=AMBER, fs=7.5)
-    _box(ax, 69, 56, 28, 9, "failed + rung exhausted\n->  ESCALATE (verifier evidence)", fc="white", ec=AMBER, fs=7.2)
-    _arrow(ax, (80, 78), (16, 65), color=GREEN, lw=1.3, rad=0.15)
-    _arrow(ax, (84, 78), (49, 65), color=AMBER, lw=1.2, rad=0.08)
-    _arrow(ax, (88, 78), (83, 65), color=AMBER, lw=1.2)
-    _arrow(ax, (49, 56), (14, 78), color=AMBER, lw=1.1, rad=0.3, ls="--")
-
-    _box(ax, 3, 34, 44, 9, "harness_ok = False  (pytest missing, rc 127)\nbackend_failed = True  (empty vLLM response)",
-         fc="#FDECEA", ec=RED, fs=7.5)
-    _box(ax, 53, 34, 44, 9, "->  ABORT.  NEVER ESCALATE.\ninfrastructure is not evidence about the model",
-         fc="#FDECEA", ec=RED, fs=7.5, bold=True)
-    _arrow(ax, (47, 38.5), (53, 38.5), color=RED, lw=1.4)
-    _arrow(ax, (92, 78), (92, 43), color=RED, lw=1.2, ls="--")
-
-    # Ladder
-    _box(ax, 3, 12, 94, 17, "", fc=LIGHT, ec=GRID)
-    ax.text(4.5, 26, "THE LADDER — greenest CODE-CAPABLE rung first, escalate only on evidence",
-            fontsize=8, color=DARK, fontweight="bold")
-    _box(ax, 5, 14, 26, 8.5, "TinyLlama / DialoGPT\nEXCLUDED — cannot finish\na coding task", fc="white", ec=RED, fs=7)
-    _box(ax, 36, 14, 26, 8.5, "rung 1: Qwen2.5-Coder-1.5B\n0.028 g typical completion", fc="white", ec=GREEN, fs=7.5, bold=True)
-    _box(ax, 67, 14, 26, 8.5, "rung 2: Qwen2.5-Coder-7B-AWQ\nonly on verifier evidence", fc="white", ec=AMBER, fs=7.5)
-    _arrow(ax, (62, 18.2), (67, 18.2), color=AMBER, lw=1.3)
-    ax.text(31.5, 18.2, "X", fontsize=13, color=RED, fontweight="bold", ha="center", va="center")
-
-    ax.text(50, 6,
-            "The tests are the SPEC and are FROZEN once written — an unfrozen verifier gets reward-hacked "
-            "(the 7B rewrote the tests to assert its own bug).\n"
-            "invalid_test_reason() gates what may BECOME a spec; caller-supplied tests remove the model from "
-            "spec authorship entirely.",
-            ha="center", fontsize=7.6, color=SOFT, style="italic")
-
-    ax.set_title("LLD — coding_agent.py: carbon per successful completion", loc="left",
-                 fontsize=11.5, color=DARK, fontweight="bold", pad=8)
-    fig.tight_layout()
-    return _save(fig, "diag_agent.png")
-
-
-# ==========================================================================
-# 13. Data + audit
+# 9. Data + audit
 # ==========================================================================
 def diag_data():
     fig, ax = _canvas(9.6, 3.6)
@@ -764,7 +551,6 @@ def diag_data():
             "candidate_rankings[:5] — every CSS breakdown, not just the winner  ·  selected_candidate (C_op, C_emb)\n"
             "eco_actions (deferral · reroute · low-carbon window)  ·  guardrail_trace.{input,output}\n"
             "grid_carbon · system_power_w · gpu_co2_g · tokens.{in,out,co2_per_token_ug} · actual_latency_ms\n"
-            "spec_source (caller | model) — 'it passed your tests' and 'it passed its own' are different claims\n"
             "_hmac  =  SHA-256 over the canonical JSON body (AUDIT_HMAC_KEY, server-only)",
             fontsize=7.4, color=INK, va="top", linespacing=1.7, family="DejaVu Sans")
 
@@ -781,9 +567,6 @@ def diag_data():
 
 if __name__ == "__main__":
     print("figures ->")
-    fig_paradox()
-    fig_spec_authorship()
-    fig_harness_fixes()
     fig_zoo_landscape()
     fig_carbon_split()
     fig_css_weights()
@@ -792,6 +575,5 @@ if __name__ == "__main__":
     diag_hld()
     diag_workflow()
     diag_css()
-    diag_agent()
     diag_data()
     print("done")

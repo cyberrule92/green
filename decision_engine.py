@@ -59,6 +59,7 @@ from secret_box import secret_decrypt, secret_encrypt
 from model_zoo import get_model_zoo
 from model_zoo_updater import get_zoo_updater
 from model_onboarding import HFError, ModelOnboardingService
+from finetuning import FineTuningService
 from monitoring_layer import (
     fetch_all_zone_signals,
     fetch_grid_signal,
@@ -95,7 +96,7 @@ from tenancy import (
     tenant_metadata,
 )
 from fastapi import Depends, Header
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 
 try:
     from simpleeval import EvalWithCompoundTypes as _SimpleEvalCls
@@ -125,13 +126,6 @@ VLLM_MOE_URL = os.getenv("VLLM_MOE_URL", VLLM_FULL_URL)
 VLLM_STEM_MATH_URL = os.getenv("VLLM_STEM_MATH_URL", VLLM_FULL_URL)
 VLLM_STEM_SCIENCE_URL = os.getenv("VLLM_STEM_SCIENCE_URL", VLLM_FULL_URL)
 VLLM_STEM_CODING_URL = os.getenv("VLLM_STEM_CODING_URL", VLLM_FULL_URL)
-# Coding-agent escalation rung. Pointedly does NOT default to VLLM_FULL_URL like
-# the endpoints above: the agent escalates here only after the 1.5B coder fails
-# its verifier, and quietly serving a general instruct model under the name
-# "Qwen2.5-Coder-7B" would corrupt both the answer and the audit trail. When the
-# container is down this URL simply fails its health probe, and coding_agent
-# reports escalation_unavailable instead of falling through.
-VLLM_CODER7B_URL = os.getenv("VLLM_CODER7B_URL", "http://127.0.0.1:8009/v1")
 # Llama2-7B always-available fallback (paper §4.3). Defaults to VLLM_FULL_URL —
 # operators that spin up the dedicated CPU container should set VLLM_FALLBACK_URL.
 VLLM_FALLBACK_URL = os.getenv("VLLM_FALLBACK_URL", VLLM_FULL_URL)
@@ -151,7 +145,6 @@ _VLLM_ENDPOINTS_BY_ENV: dict[str, str] = {
     "VLLM_STEM_MATH_URL":    VLLM_STEM_MATH_URL,
     "VLLM_STEM_SCIENCE_URL": VLLM_STEM_SCIENCE_URL,
     "VLLM_STEM_CODING_URL":  VLLM_STEM_CODING_URL,
-    "VLLM_CODER7B_URL":      VLLM_CODER7B_URL,
     "VLLM_FALLBACK_URL":     VLLM_FALLBACK_URL,
 }
 
@@ -171,7 +164,6 @@ MODEL_NAME_MAP = {
     "stem-math":    "Qwen2.5-Math-1.5B-Instruct",
     "stem-science": "Qwen2.5-1.5B-Instruct",
     "stem-coding":  "Qwen2.5-Coder-1.5B-Instruct",
-    "coder-7b":     "Qwen2.5-Coder-7B-Instruct-AWQ",
 }
 
 # Default per-variant HF model IDs. The zoo entry's `vllm_model_id` overrides
@@ -185,7 +177,6 @@ VLLM_MODEL_MAP: dict[str, str] = {
     "stem-math":   "Qwen/Qwen2.5-Math-1.5B-Instruct",
     "stem-science":"Qwen/Qwen2.5-1.5B-Instruct",
     "stem-coding": "Qwen/Qwen2.5-Coder-1.5B-Instruct",
-    "coder-7b":    "Qwen/Qwen2.5-Coder-7B-Instruct-AWQ",
 }
 
 # Default per-variant endpoint. Each variant points at its dedicated env-var
@@ -199,7 +190,6 @@ VLLM_URL_MAP: dict[str, str] = {
     "stem-math":   VLLM_STEM_MATH_URL,
     "stem-science":VLLM_STEM_SCIENCE_URL,
     "stem-coding": VLLM_STEM_CODING_URL,
-    "coder-7b":    VLLM_CODER7B_URL,
 }
 
 STEM_VARIANT_FOR_DOMAIN: dict[str, str] = {
@@ -2230,11 +2220,6 @@ _VARIANT_UPGRADE_MAP: dict[str, str | None] = {
     "stem-math":    "full",
     "stem-science": "full",
     "stem-coding":  "full",
-    # None, not "full": coder-7b is the top of the coding-agent ladder. Stepping
-    # down into a general instruct model would hand the agent a worse coder while
-    # labelling it an escalation. If this endpoint is down, fail and say so —
-    # coding_agent's liveness gate catches it before we ever get here.
-    "coder-7b":     None,
 }
 
 # Per-variant context window. Mirrors --max-model-len in
@@ -2248,13 +2233,10 @@ _VARIANT_MAX_MODEL_LEN: dict[str, int] = {
     "moe":          8192,
     "stem-math":    2048,
     "stem-science": 2048,
-    # 4096 for both coding rungs: the agent's repair prompt carries the task, the
-    # current files and the failing test output. At 2048 it overflows, vLLM 400s,
-    # and the repair silently lands on a different model. coding_agent caps that
-    # prompt so 4096 is enough — and KV cache at 8192 costs GPU we need for the
-    # coder-7b rung itself.
+    # 4096, not 2048: a coding prompt carries the task plus surrounding context,
+    # which overflows 2048 and makes vLLM 400. 8192 is not worth its KV cost on
+    # this slice.
     "stem-coding":  4096,
-    "coder-7b":     4096,
 }
 
 
@@ -5441,140 +5423,6 @@ async def sustainability_csrd_report(
     return report
 
 
-# ---------------------------------------------------------------------------
-# Agentic coding harness (LangGraph)
-#
-# Deliberately NOT routed through CSS. CSS scores carbon per request; an agent
-# is a loop, so its cost is tokens x steps x attempts. The greenest-per-token
-# candidate (TinyLlama/DialoGPT) cannot complete a coding task and would just
-# burn the step budget failing — see coding_agent.AGENT_LADDER. The harness
-# optimises carbon per *successful completion* instead, starting at the greenest
-# code-capable model and escalating only on verifier evidence.
-# ---------------------------------------------------------------------------
-
-class AgentTaskModel(BaseModel):
-    task: str
-    test_command: str = "python -m pytest -q"
-    carbon_budget_g: float | None = None
-    keep_workspace: bool = True
-    # Escape hatch for a dirty grid: run inline instead of queueing for the next
-    # low-carbon window. Deferral is right for real work but blocks a live demo.
-    allow_defer: bool = True
-    # Caller-supplied frozen spec: a pytest source string, or {path: source}. Left
-    # unset, the ladder's weakest rung authors the tests it is then judged against —
-    # which is fine until the spec is confidently wrong (see coding_agent._SPEC_PROMPT).
-    tests: str | dict[str, str] | None = None
-
-
-def _log_agent_result(result: dict[str, Any]) -> None:
-    """
-    Audit one agent task. Passed to the harness as ``on_complete`` rather than
-    called from the endpoint: a deferred task finishes hours after its HTTP
-    request has returned, so the endpoint is not around to write the entry.
-    """
-    try:
-        log_decision({
-            "type": "agent_task",
-            "task_id": result.get("task_id"),
-            "status": result.get("status"),
-            "final_tier": result.get("final_tier"),
-            "escalated": result.get("escalated"),
-            "llm_calls": result.get("total_llm_calls"),
-            "carbon_g": result.get("carbon_g"),
-            "grid_ci": result.get("grid_ci"),
-            "deferred": result.get("deferred"),
-            "spec_source": result.get("spec_source"),
-        })
-    except Exception:
-        logger.warning("agent: audit log write failed", exc_info=True)
-
-
-@app.post("/api/agent/task")
-def api_agent_task(payload: AgentTaskModel) -> dict[str, Any]:
-    """
-    Submit one agentic coding task under a carbon budget.
-
-    Returns the finished task when the grid is clean enough to run it inline. On
-    a dirty grid (> AGENT_DEFER_CI) it returns immediately with status "queued"
-    and the task runs later, in the greenest window the forecast offers — poll
-    GET /api/agent/task/{task_id} for the outcome.
-    """
-    import coding_agent
-
-    if not coding_agent.AGENT_ENABLED:
-        raise HTTPException(status_code=503, detail="agent harness disabled (AGENT_ENABLED)")
-    if not payload.task.strip():
-        raise HTTPException(status_code=400, detail="task must not be empty")
-
-    # _is_vllm_live lets the harness refuse to escalate into a rung whose
-    # container is down, rather than silently falling through to a general model.
-    coding_agent.set_inference_fn(run_vllm_inference, _is_vllm_live)
-    try:
-        result = coding_agent.run_coding_task(
-            task=payload.task,
-            test_command=payload.test_command,
-            carbon_budget_g=payload.carbon_budget_g,
-            keep_workspace=payload.keep_workspace,
-            allow_defer=payload.allow_defer,
-            on_complete=_log_agent_result,
-            tests=payload.tests,
-        )
-    except ValueError as exc:
-        # An unusable caller spec is rejected before a single token is spent — the
-        # harness freezes the tests, so a broken one would otherwise fail every rung.
-        raise HTTPException(status_code=400, detail=f"invalid tests: {exc}") from exc
-
-    # A queued task has not run yet, so on_complete has not fired. Record the
-    # deferral itself — it is the carbon decision worth auditing.
-    if result.get("status") == "queued":
-        _log_agent_result(result)
-
-    return result
-
-
-@app.get("/api/agent/tasks")
-def api_agent_tasks(limit: int = 20) -> dict[str, Any]:
-    """Recent agent tasks, newest first (summaries, no result payload)."""
-    import coding_agent
-
-    return {"tasks": coding_agent.list_tasks(limit=max(1, min(limit, 100)))}
-
-
-@app.get("/api/agent/task/{task_id}")
-def api_agent_task_status(task_id: str) -> dict[str, Any]:
-    """Full record for one task — how a queued task is followed to completion."""
-    import coding_agent
-
-    record = coding_agent.get_task(task_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail=f"unknown agent task {task_id}")
-    return record
-
-
-@app.get("/api/agent/status")
-def api_agent_status() -> dict[str, Any]:
-    """Harness configuration + orchestrator availability (for the UI sidebar)."""
-    import coding_agent
-
-    return {
-        "enabled": coding_agent.AGENT_ENABLED,
-        "orchestrator": "langgraph" if coding_agent.LANGGRAPH_AVAILABLE else "fallback",
-        "ladder": [
-            {
-                "variant": v,
-                "target_id": t,
-                "label": lbl,
-                "live": _is_vllm_live(v, t),
-            }
-            for v, t, lbl in coding_agent.AGENT_LADDER
-        ],
-        "attempts_per_tier": coding_agent.AGENT_ATTEMPTS_PER_TIER,
-        "carbon_budget_g": coding_agent.AGENT_CARBON_BUDGET_G,
-        "defer_above_ci": coding_agent.AGENT_DEFER_CI,
-        "deferral_ms": coding_agent.AGENT_DEFERRAL_MS,
-    }
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Model onboarding (/api/models)
 #
@@ -5719,6 +5567,96 @@ async def api_models_onboard(request: Request) -> dict[str, Any]:
     return job.to_dict()
 
 
+@app.post("/api/models/quantize")
+async def api_models_quantize(request: Request) -> dict[str, Any]:
+    """Quantize a model and stop there — no zoo entry, no routing.
+
+    Same pipeline as ``/api/models/onboard`` with the registration step skipped.
+    Quantizing a model and adding a rung to this deployment's ladder are separate
+    decisions: the checkpoint is a deliverable an operator can download and run
+    elsewhere, and forcing it into the registry would leave unavailable entries
+    behind for models nobody here intends to serve.
+
+    ``allow_local_quantize`` defaults to true here — unlike onboarding, where a
+    pre-quantized sibling is the preferred outcome, a caller asking to *quantize*
+    is asking for the calibration pass. It is still metered, and the plan still
+    prefers an existing upstream checkpoint when one exists and ``prefer`` allows.
+    """
+    body = await request.json()
+    repo_id = str(body.get("repo_id") or "").strip()
+    if not repo_id:
+        raise HTTPException(status_code=400, detail="repo_id is required")
+    svc = _get_onboarding_service()
+    try:
+        job = svc.start(
+            repo_id,
+            model_id=body.get("model_id"),
+            max_model_len=int(body.get("max_model_len") or 2048),
+            prefer=body.get("prefer") or "awq",
+            allow_local_quantize=bool(body.get("allow_local_quantize", True)),
+            trust_remote_code=bool(body.get("trust_remote_code")),
+            register=False,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _audit_onboarding(
+        "quantize_only", {"repo_id": repo_id, "job_id": job.job_id, "model_id": job.model_id}
+    )
+    return job.to_dict()
+
+
+@app.get("/api/models/artifacts")
+def api_models_artifacts() -> dict[str, Any]:
+    """Quantized checkpoints on disk, whether or not they were registered."""
+    return {"artifacts": _get_onboarding_service().list_artifacts()}
+
+
+@app.get("/api/models/artifacts/{artifact_id}")
+def api_models_artifact(artifact_id: str) -> dict[str, Any]:
+    try:
+        artifact = _get_onboarding_service().get_artifact(artifact_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if artifact is None:
+        raise HTTPException(status_code=404, detail=f"no quantized artifact named {artifact_id!r}")
+    return artifact
+
+
+@app.get("/api/models/artifacts/{artifact_id}/download")
+def api_models_artifact_download(artifact_id: str) -> StreamingResponse:
+    """Stream the quantized checkpoint as an uncompressed tar.
+
+    Streamed rather than staged: these are multi-gigabyte directories and this
+    host runs at 65% full, so building a copy to serve would need the space
+    twice. Uncompressed because 4-bit safetensors do not compress — gzip would
+    cost minutes of CPU per download for low single-digit percent.
+    """
+    svc = _get_onboarding_service()
+    try:
+        filename, chunks = svc.stream_artifact(artifact_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    _audit_onboarding("artifact_download", {"artifact_id": artifact_id})
+    return StreamingResponse(
+        chunks,
+        media_type="application/x-tar",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.delete("/api/models/artifacts/{artifact_id}")
+def api_models_artifact_delete(artifact_id: str, _admin: bool = Depends(require_admin)) -> dict[str, Any]:
+    """Delete a quantized checkpoint. Refused while the zoo still references it."""
+    try:
+        result = _get_onboarding_service().delete_artifact(artifact_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _audit_onboarding("artifact_delete", {"artifact_id": artifact_id, "freed_gb": result["freed_gb"]})
+    return result
+
+
 @app.post("/api/models/{model_id}/serve")
 async def api_models_serve(model_id: str, request: Request) -> dict[str, Any]:
     body = await request.json() if await request.body() else {}
@@ -5769,6 +5707,184 @@ async def api_models_measure(model_id: str, request: Request) -> dict[str, Any]:
             "available": entry.get("available"),
         },
     )
+    return entry
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Fine-tuning (/api/finetune)
+#
+# Carbon-aware LoRA training: turn collected up-votes into an adapter that makes
+# a *small* model good enough at this deployment's traffic that the router can
+# stop escalating. The counterpart to model onboarding — onboarding imports a
+# better rung, this one improves the one already there.
+#
+# Training is the largest single compute event the system performs, so it is
+# metered and deferred to the cleanest window the forecast offers. Nobody is
+# waiting on it, which is what makes that deferral free.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_FINETUNE_SERVICE: FineTuningService | None = None
+
+
+def _ft_feedback_records() -> list[dict[str, Any]]:
+    """Up-voted (prompt, response) pairs across every tenant.
+
+    Only positives: a down-vote says what *not* to say, which supervised
+    fine-tuning cannot consume.
+    """
+    return store.export_feedback_dataset(tenant_id=None, only_positive=True)
+
+
+def _ft_low_carbon_window(duration_hours: float) -> dict[str, Any] | None:
+    """Adapt the module's ``duration_hours`` question to the forecast API.
+
+    ``find_low_carbon_window`` takes a forecast list and a deferral budget in ms,
+    so the budget is the job's own length plus the configured look-ahead — there
+    is no point picking a window that ends before the job does.
+    """
+    try:
+        forecast = get_zone_forecast()
+    except Exception as exc:  # noqa: BLE001 - forecast is best-effort
+        logger.warning("forecast unavailable for fine-tune scheduling: %s", exc)
+        return None
+    look_ahead_h = float(os.getenv("FINETUNE_LOOKAHEAD_H", "48"))
+    budget_ms = int(max(duration_hours, 0.5) * 3600 * 1000 + look_ahead_h * 3600 * 1000)
+    return find_low_carbon_window(forecast, budget_ms)
+
+
+def _get_finetune_service() -> FineTuningService:
+    global _FINETUNE_SERVICE
+    if _FINETUNE_SERVICE is None:
+        _FINETUNE_SERVICE = FineTuningService(
+            get_model_zoo(),
+            feedback_records=_ft_feedback_records,
+            grid_ci=_current_grid_ci,
+            find_low_carbon_window=_ft_low_carbon_window,
+            system_metrics=fetch_system_metrics,
+            state_path=DATA_DIR / "finetuning.json",
+        )
+    return _FINETUNE_SERVICE
+
+
+@app.get("/api/finetune/capability")
+def api_finetune_capability() -> dict[str, Any]:
+    """What fine-tuning can do here, and what is blocking it when it cannot."""
+    try:
+        return _get_finetune_service().capability()
+    except Exception as exc:  # noqa: BLE001 - capability must never 500
+        return {"enabled": False, "reason": f"fine-tuning unavailable: {exc}"}
+
+
+@app.get("/api/finetune/dataset")
+def api_finetune_dataset(_admin: bool = Depends(require_admin)) -> dict[str, Any]:
+    """Dataset the collected feedback would produce, with every rejection itemised."""
+    return _get_finetune_service().dataset_preview()["stats"]
+
+
+@app.get("/api/finetune/preview")
+def api_finetune_preview(
+    base_model_id: str,
+    method: str = "qlora",
+    lora_rank: int = 16,
+    epochs: int = 3,
+    _admin: bool = Depends(require_admin),
+) -> dict[str, Any]:
+    """Plan a run without committing: sizing, estimated carbon, and when to start."""
+    try:
+        return _get_finetune_service().preview(
+            base_model_id, method=method, lora_rank=lora_rank, epochs=epochs
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/finetune/jobs")
+def api_finetune_jobs(limit: int = 50, _admin: bool = Depends(require_admin)) -> dict[str, Any]:
+    return {"jobs": _get_finetune_service().list_jobs(limit=limit)}
+
+
+@app.get("/api/finetune/jobs/{job_id}")
+def api_finetune_job(job_id: str, _admin: bool = Depends(require_admin)) -> dict[str, Any]:
+    job = _get_finetune_service().get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"job {job_id} not found")
+    return job.to_dict()
+
+
+@app.post("/api/finetune/jobs")
+async def api_finetune_submit(request: Request, _admin: bool = Depends(require_admin)) -> dict[str, Any]:
+    body = await request.json()
+    base_model_id = str(body.get("base_model_id") or "").strip()
+    if not base_model_id:
+        raise HTTPException(status_code=400, detail="base_model_id is required")
+    svc = _get_finetune_service()
+    try:
+        job = svc.submit(
+            base_model_id,
+            method=str(body.get("method") or "qlora"),
+            lora_rank=int(body.get("lora_rank") or 16),
+            epochs=int(body.get("epochs") or 3),
+            adapter_id=body.get("adapter_id"),
+            force_now=bool(body.get("force_now")),
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    log_decision({"event": "finetune", "action": "submit", "job_id": job.job_id,
+                  "base_model_id": base_model_id, "adapter_id": job.adapter_id})
+    return job.to_dict()
+
+
+@app.post("/api/finetune/jobs/{job_id}/cancel")
+def api_finetune_cancel(job_id: str, _admin: bool = Depends(require_admin)) -> dict[str, Any]:
+    try:
+        result = _get_finetune_service().cancel(job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    log_decision({"event": "finetune", "action": "cancel", "job_id": job_id, "ok": result["ok"]})
+    return result
+
+
+@app.post("/api/finetune/adapters/{adapter_id}/serve")
+def api_finetune_serve(adapter_id: str, _admin: bool = Depends(require_admin)) -> dict[str, Any]:
+    """Serve base + adapter through one vLLM container (--enable-lora)."""
+    try:
+        result = _get_finetune_service().serve_adapter(adapter_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    log_decision({"event": "finetune", "action": "serve", "adapter_id": adapter_id, "ok": result["ok"]})
+    return result
+
+
+@app.post("/api/finetune/adapters/{adapter_id}/measure")
+async def api_finetune_measure(
+    adapter_id: str, request: Request, _admin: bool = Depends(require_admin)
+) -> dict[str, Any]:
+    """Promote a measured adapter to routable, and record its carbon payback.
+
+    The only path that sets ``available: true`` for an adapter. Fine-tuning
+    exists because quality is expected to change, so assuming the direction of
+    that change is exactly the thing this refuses to do.
+    """
+    body = await request.json()
+    basis = str(body.get("basis") or "").strip()
+    if not basis:
+        raise HTTPException(
+            status_code=400,
+            detail="basis is required — it records where the figures came from (e.g. 'measured:eval-01')",
+        )
+    try:
+        entry = _get_finetune_service().apply_measurement(
+            adapter_id, body.get("measurement") or {}, basis=basis
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    log_decision({
+        "event": "finetune", "action": "measure", "adapter_id": adapter_id, "basis": basis,
+        "accuracy_baseline": entry.get("accuracy_baseline"),
+        "training_payback": entry.get("training_payback"),
+    })
     return entry
 
 

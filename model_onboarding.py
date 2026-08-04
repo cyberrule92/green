@@ -50,7 +50,7 @@ measurement showed:
    requests-to-break-even figure against the rung it would replace — a quantizer
    that hides its own footprint has no business in a carbon system.
 
-Dependency posture matches ``workflows.py`` and ``coding_agent.py``: no import of
+Dependency posture: no import of
 ``decision_engine`` (that would cycle), no new third-party dependency. The Docker
 control plane is raw HTTP over the unix socket via stdlib ``http.client``, and
 grid carbon intensity is injected as a callable rather than imported.
@@ -1117,6 +1117,15 @@ class DockerClient:
 CONTAINER_PREFIX = "green-onboard-"
 ONBOARD_LABEL = "green.onboarded=1"
 
+# Where the shared Hugging Face cache is mounted *inside* every container this
+# module launches. It is not the API container's own HF_HOME, and conflating the
+# two silently loses work: a quantization pass told to write to the API's
+# /app/data/hf-cache writes it inside its own throwaway filesystem instead of the
+# bind mount, and the vLLM container that is then asked to serve that path finds
+# nothing there. Any path handed to a launched container must be expressed
+# against this root.
+CONTAINER_HF_CACHE = "/root/.cache/huggingface"
+
 
 def endpoint_env_name(model_id: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9]+", "_", model_id).strip("_").upper()
@@ -1293,7 +1302,7 @@ class ServingManager:
             # Arbitrary code execution from a third-party repo. Never defaulted on.
             cmd.append("--trust-remote-code")
 
-        env = [f"HF_HOME=/root/.cache/huggingface"]
+        env = [f"HF_HOME={CONTAINER_HF_CACHE}"]
         if self.hf_token:
             env.append(f"HF_TOKEN={self.hf_token}")
 
@@ -1308,7 +1317,7 @@ class ServingManager:
                 "green.quant_format": plan.quant_format,
             },
             "HostConfig": {
-                "Binds": [f"{self.hf_cache_host_path}:/root/.cache/huggingface"],
+                "Binds": [f"{self.hf_cache_host_path}:{CONTAINER_HF_CACHE}"],
                 "NetworkMode": self.network,
                 "ShmSize": 4 * 1024**3,
                 "RestartPolicy": {"Name": "unless-stopped"},
@@ -1524,7 +1533,7 @@ class LocalQuantizer:
 
         name = f"{CONTAINER_PREFIX}quant-{uuid.uuid4().hex[:8]}"
         cmd = self.command_template.format(repo_id=repo_id, out_dir=out_dir)
-        env = ["HF_HOME=/root/.cache/huggingface"]
+        env = [f"HF_HOME={CONTAINER_HF_CACHE}"]
         if self.hf_token:
             env.append(f"HF_TOKEN={self.hf_token}")
         config = {
@@ -1533,7 +1542,7 @@ class LocalQuantizer:
             "Env": env,
             "Labels": {"green.onboarded": "1", "green.role": "quantize", "green.repo_id": repo_id},
             "HostConfig": {
-                "Binds": [f"{self.hf_cache_host_path}:/root/.cache/huggingface"],
+                "Binds": [f"{self.hf_cache_host_path}:{CONTAINER_HF_CACHE}"],
                 "ShmSize": 4 * 1024**3,
                 "DeviceRequests": [{"Driver": "nvidia", "Count": -1, "Capabilities": [["gpu"]]}],
             },
@@ -1584,6 +1593,107 @@ class LocalQuantizer:
         return QuantizationResult(
             True, "quantization completed", duration_s, energy_wh, carbon_g, ci, output_dir=out_dir, logs=logs
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Quantized artifacts
+#
+# A quantized checkpoint is a deliverable in its own right, separate from the
+# routing decision. Quantizing a model and adding a rung to *this* deployment's
+# ladder are two different choices: an operator may well want a 4-bit build to
+# take away and run somewhere else, and making that require a zoo entry would
+# leave the registry full of unavailable models nobody here intends to serve.
+#
+# So the pass writes to the shared HF cache, an artifact record goes beside it,
+# and the checkpoint can be listed, downloaded and deleted without ever touching
+# the zoo. Registration remains available; it is just no longer mandatory.
+#
+# Path discipline: the pass ran in a container that sees the cache at
+# CONTAINER_HF_CACHE, while the API process sees the same bytes at its own
+# HF_HOME. Serving needs the container path, download needs the local one, and
+# these two helpers are the only place that conversion happens.
+# ─────────────────────────────────────────────────────────────────────────────
+
+ARTIFACT_META_FILE = ".green_artifact.json"
+
+
+def container_artifact_path(model_id: str) -> str:
+    """Where a launched container sees the quantized checkpoint."""
+    return f"{CONTAINER_HF_CACHE}/quantized/{model_id}"
+
+
+def _dir_size_bytes(path: str | Path) -> int:
+    total = 0
+    for root, _dirs, files in os.walk(str(path)):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                continue
+    return total
+
+
+def _safe_artifact_id(model_id: str) -> str:
+    """Reject anything that could escape the quantized directory.
+
+    This value reaches a filesystem path from an HTTP route parameter, so it is
+    validated rather than sanitised: a caller asking for ``../../etc`` has not
+    made a typo worth guessing at.
+    """
+    mid = str(model_id or "").strip()
+    if not mid or mid != re.sub(r"[^A-Za-z0-9._-]", "", mid) or mid.startswith("."):
+        raise ValueError(f"invalid artifact id {model_id!r}")
+    return mid
+
+
+def iter_tar_stream(root: str | Path, arcname: str, chunk_size: int = 1024 * 1024):
+    """Yield an uncompressed tar of ``root`` without staging a copy on disk.
+
+    Uncompressed on purpose. Safetensors weights are already dense — 4-bit AWQ
+    weights especially so — and gzip buys low single-digit percent for minutes of
+    CPU on every download. Staging a compressed copy first would also need as
+    much free disk again, on a box that runs at 65% full.
+
+    The tar is written into an OS pipe by a worker thread and read back out here.
+    A ``fileobj`` that simply accumulates what tarfile hands it would hold an
+    entire weight shard in memory before the generator ever got a chance to drain
+    it — tarfile writes one member in a single ``add()`` call, and these members
+    are gigabytes. The pipe's kernel buffer supplies the backpressure instead, so
+    peak memory is a buffer rather than a shard.
+    """
+    import tarfile  # noqa: PLC0415 - only needed on the download path
+
+    read_fd, write_fd = os.pipe()
+    error: list[BaseException] = []
+
+    def produce() -> None:
+        try:
+            with os.fdopen(write_fd, "wb") as sink, tarfile.open(
+                fileobj=sink, mode="w|", bufsize=chunk_size
+            ) as tar:
+                for item in sorted(Path(root).rglob("*")):
+                    if item.is_dir():
+                        continue
+                    tar.add(str(item), arcname=f"{arcname}/{item.relative_to(root)}", recursive=False)
+        except (BrokenPipeError, ValueError):
+            # The client hung up mid-download. Normal, not an error worth raising.
+            pass
+        except BaseException as exc:  # noqa: BLE001 - carried to the consumer
+            error.append(exc)
+
+    worker = threading.Thread(target=produce, daemon=True, name=f"tar-{arcname}")
+    worker.start()
+    try:
+        with os.fdopen(read_fd, "rb") as source:
+            while True:
+                chunk = source.read(chunk_size)
+                if not chunk:
+                    break
+                yield chunk
+    finally:
+        worker.join(timeout=30)
+    if error:
+        raise error[0]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1742,7 +1852,10 @@ def measurement_patch(measurement: dict[str, Any], basis: str) -> dict[str, Any]
 # Orchestration
 # ─────────────────────────────────────────────────────────────────────────────
 
-JOB_STATES = ("queued", "planning", "downloading", "quantizing", "registering", "serving", "succeeded", "failed")
+JOB_STATES = (
+    "queued", "planning", "downloading", "quantizing", "packaging",
+    "registering", "serving", "succeeded", "failed",
+)
 
 
 @dataclass
@@ -1758,6 +1871,13 @@ class OnboardJob:
     error: str | None = None
     carbon_g: float = 0.0
     auto_serve: bool = False
+    # False for a quantize-only run: produce the checkpoint, skip the zoo.
+    # Quantizing a model and routing to it are separate decisions — an operator
+    # may want a 4-bit build to take away and deploy elsewhere without adding a
+    # rung to this deployment's ladder, and forcing registration would leave
+    # unavailable entries cluttering the registry for models nobody here serves.
+    register: bool = True
+    artifact_dir: str | None = None
 
     def note(self, step: str, detail: str, **extra: Any) -> None:
         self.steps.append({"step": step, "detail": detail, "at": utc_now_iso(), **extra})
@@ -1776,6 +1896,8 @@ class OnboardJob:
             "error": self.error,
             "quantization_carbon_g": round(self.carbon_g, 4),
             "auto_serve": self.auto_serve,
+            "register": self.register,
+            "artifact_dir": self.artifact_dir,
         }
 
 
@@ -1887,6 +2009,7 @@ class ModelOnboardingService:
         trust_remote_code: bool = False,
         donor_id: str | None = None,
         max_output_tokens: int = 512,
+        register: bool = True,
     ) -> OnboardJob:
         if not _env_flag("MODEL_ONBOARD_ENABLED", False):
             raise PermissionError("model onboarding is disabled; set MODEL_ONBOARD_ENABLED=true to enable it")
@@ -1895,8 +2018,15 @@ class ModelOnboardingService:
                 "trust_remote_code executes arbitrary code from the model repo. It is refused unless "
                 "MODEL_ONBOARD_ALLOW_TRUST_REMOTE_CODE=true is set deliberately."
             )
+        if auto_serve and not register:
+            # Serving means routing, and routing means the zoo. Silently ignoring
+            # one of the two flags would be worse than refusing.
+            raise ValueError("auto_serve requires register=true; an unregistered model has nothing to route to")
         mid = model_id or f"onboard-{re.sub(r'[^a-z0-9]+', '-', repo_id.lower()).strip('-')}"
-        job = OnboardJob(job_id=uuid.uuid4().hex[:12], repo_id=repo_id, model_id=mid, auto_serve=auto_serve)
+        job = OnboardJob(
+            job_id=uuid.uuid4().hex[:12], repo_id=repo_id, model_id=mid,
+            auto_serve=auto_serve, register=register,
+        )
         with self._lock:
             self._jobs[job.job_id] = job
             self._save_jobs()
@@ -1949,13 +2079,39 @@ class ModelOnboardingService:
 
             if plan.source == "local_quantize":
                 job.state = "quantizing"
-                out_dir = os.path.join(self.cache_dir, "quantized", job.model_id)
+                # Container-relative, not self.cache_dir: the quantizer writes it
+                # and the vLLM container reads it, and both see the shared cache
+                # at CONTAINER_HF_CACHE. The API container never opens this path.
+                out_dir = f"{CONTAINER_HF_CACHE}/quantized/{job.model_id}"
                 result = self.quantizer.run(plan.download_repo_id, out_dir)
                 job.carbon_g = result.carbon_g
                 job.note("quantize", result.detail, **result.to_dict())
                 if not result.ok:
                     raise RuntimeError(result.detail)
                 plan.serve_repo_id = out_dir
+                job.artifact_dir = out_dir
+                self._write_artifact_meta(job, preview["model"], plan, result)
+
+            if not job.register:
+                # Quantize-only: the checkpoint exists and is downloadable, and
+                # that is the whole deliverable. Nothing enters the zoo, so CSS
+                # never sees it and no unavailable entry is left behind.
+                if not job.artifact_dir:
+                    raise RuntimeError(
+                        f"nothing to hand back: the plan resolved to '{plan.source}', which produces no "
+                        "local artifact. Quantize-only needs a local pass — request prefer=awq with "
+                        "allow_local_quantize=true, or download the pre-quantized repo from the hub directly."
+                    )
+                local = self.artifact_local_path(job.model_id)
+                job.note(
+                    "packaging",
+                    f"quantized checkpoint ready at {job.artifact_dir} — not registered, "
+                    "download it from the artifacts list",
+                    artifact_dir=job.artifact_dir,
+                    size_gb=round(_dir_size_bytes(local) / 1e9, 3) if local else None,
+                )
+                job.state = "succeeded"
+                return
 
             job.state = "registering"
             donor = self._pick_donor(donor_id)
@@ -1995,6 +2151,131 @@ class ModelOnboardingService:
             job.updated_at = utc_now_iso()
             with self._lock:
                 self._save_jobs()
+
+    # -- quantized artifacts -------------------------------------------------
+
+    def artifact_local_path(self, model_id: str) -> Path | None:
+        """The quantized checkpoint as *this* process can open it, or None.
+
+        The container wrote it to CONTAINER_HF_CACHE; the API sees the same bytes
+        under its own HF_HOME because both are the one host directory.
+        """
+        mid = _safe_artifact_id(model_id)
+        path = Path(self.cache_dir) / "quantized" / mid
+        return path if path.is_dir() else None
+
+    def _write_artifact_meta(
+        self, job: OnboardJob, model_summary: dict[str, Any], plan: Any, result: QuantizationResult
+    ) -> None:
+        """Record provenance next to the weights, so the directory is self-describing.
+
+        A quantized checkpoint that has left this box should still be able to say
+        what it came from and what it cost to make — the carbon figure is the
+        whole point of having measured it.
+        """
+        local = self.artifact_local_path(job.model_id)
+        if local is None:
+            logger.warning("quantized dir for %s not visible to the API process", job.model_id)
+            return
+        meta = {
+            "artifact_id": job.model_id,
+            "source_repo_id": job.repo_id,
+            "quant_format": getattr(plan, "quant_format", None),
+            "created_at": utc_now_iso(),
+            "job_id": job.job_id,
+            "registered_in_zoo": job.register,
+            "quantization_carbon_g": round(result.carbon_g, 4),
+            "quantization_carbon_basis": "measured_wallclock_x_spec_tdp_upper_bound",
+            "quantization_duration_s": round(result.duration_s, 1),
+            "grid_ci_g_per_kwh": round(result.grid_ci, 1),
+            "hf_license": model_summary.get("license"),
+            # Licensing follows the weights. Whoever downloads this inherits the
+            # upstream terms, and stripping that from the tarball would be the
+            # easiest way for it to get lost.
+            "license_note": "derived work of the source repo; upstream licence terms carry over",
+        }
+        try:
+            (local / ARTIFACT_META_FILE).write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+        except OSError as exc:
+            logger.warning("could not write artifact metadata for %s: %s", job.model_id, exc)
+
+    def list_artifacts(self) -> list[dict[str, Any]]:
+        """Every quantized checkpoint on disk, registered or not."""
+        root = Path(self.cache_dir) / "quantized"
+        if not root.is_dir():
+            return []
+        out: list[dict[str, Any]] = []
+        for path in sorted(root.iterdir()):
+            if not path.is_dir():
+                continue
+            meta: dict[str, Any] = {}
+            for name in (ARTIFACT_META_FILE, "quantization_manifest.json"):
+                candidate = path / name
+                if candidate.exists():
+                    try:
+                        meta.update(json.loads(candidate.read_text(encoding="utf-8")))
+                    except (OSError, json.JSONDecodeError):
+                        continue
+            files = sorted(f.name for f in path.iterdir() if f.is_file())
+            size = _dir_size_bytes(path)
+            complete = (path / "config.json").exists() and any(
+                f.endswith((".safetensors", ".bin")) for f in files
+            )
+            out.append({
+                "artifact_id": path.name,
+                "size_gb": round(size / 1e9, 3),
+                "files": files,
+                # A pass that died mid-write leaves a directory behind. Saying so
+                # beats handing someone a tarball that will not load.
+                "complete": complete,
+                "in_zoo": bool(self.zoo.get_model(path.name)),
+                "container_path": container_artifact_path(path.name),
+                "source_repo_id": meta.get("source_repo_id"),
+                "quant_method": meta.get("quant_method") or meta.get("quant_format"),
+                "bits": meta.get("bits"),
+                "group_size": meta.get("group_size"),
+                "calibration_source": meta.get("calibration_source"),
+                "created_at": meta.get("created_at"),
+                "quantization_carbon_g": meta.get("quantization_carbon_g"),
+                "hf_license": meta.get("hf_license"),
+            })
+        return out
+
+    def get_artifact(self, model_id: str) -> dict[str, Any] | None:
+        mid = _safe_artifact_id(model_id)
+        return next((a for a in self.list_artifacts() if a["artifact_id"] == mid), None)
+
+    def stream_artifact(self, model_id: str):
+        """(filename, byte iterator) for downloading the checkpoint as a tarball."""
+        mid = _safe_artifact_id(model_id)
+        local = self.artifact_local_path(mid)
+        if local is None:
+            raise ValueError(f"no quantized artifact named {mid!r}")
+        info = self.get_artifact(mid) or {}
+        if not info.get("complete"):
+            raise ValueError(
+                f"artifact {mid!r} is incomplete (no config.json or no weight shards) — it is the "
+                "residue of a failed pass, not a servable checkpoint"
+            )
+        return f"{mid}.tar", iter_tar_stream(local, mid)
+
+    def delete_artifact(self, model_id: str) -> dict[str, Any]:
+        """Remove a quantized checkpoint from disk.
+
+        Refused while the zoo still references it: deleting the weights out from
+        under a registered rung turns a routing decision into a 500 at dispatch.
+        """
+        mid = _safe_artifact_id(model_id)
+        local = self.artifact_local_path(mid)
+        if local is None:
+            raise ValueError(f"no quantized artifact named {mid!r}")
+        if self.zoo.get_model(mid):
+            raise ValueError(
+                f"{mid!r} is registered in the model zoo; deregister it before deleting the weights"
+            )
+        freed = _dir_size_bytes(local)
+        shutil.rmtree(local)
+        return {"ok": True, "artifact_id": mid, "freed_gb": round(freed / 1e9, 3)}
 
     def _download(self, repo_id: str, job: OnboardJob) -> str:
         """Fetch the checkpoint into the shared HF cache, after a disk preflight."""

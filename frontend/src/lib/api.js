@@ -349,49 +349,6 @@ export async function downloadCsrdReportCsv(opts = {}) {
   return URL.createObjectURL(blob);
 }
 
-// Served from a summary the offline harness left in data/. Returns
-// { available: false, reason } when no run has been published yet.
-// ── Agentic coding harness (LangGraph) ───────────────────────────────────────
-// Off the CSS path: CSS scores carbon per request, but an agent is a loop, so
-// the harness optimises carbon per *successful completion* instead.
-export function fetchAgentStatus() {
-  return request("/api/agent/status");
-}
-
-// Resolves as soon as the task is accepted — not when it finishes. On a dirty
-// grid the response comes back with status "queued" and the task runs later, in
-// the greenest window the forecast offers; poll fetchAgentTask() for the result.
-// allowDefer=false forces an inline run regardless of grid intensity.
-export function submitAgentTask({
-  task,
-  testCommand = "python -m pytest -q",
-  carbonBudgetG = null,
-  allowDefer = true,
-  tests = null,
-}) {
-  return request("/api/agent/task", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      task,
-      test_command: testCommand,
-      carbon_budget_g: carbonBudgetG,
-      allow_defer: allowDefer,
-      // Omitted -> the agent writes (and freezes) its own spec. Supplied -> the
-      // spec comes from the caller and the model only writes the implementation.
-      tests: tests && tests.trim() ? tests : null,
-    }),
-  });
-}
-
-export function fetchAgentTask(taskId) {
-  return request(`/api/agent/task/${taskId}`);
-}
-
-export function fetchAgentTasks({ limit = 20 } = {}) {
-  return request(`/api/agent/tasks?limit=${limit}`);
-}
-
 // ── Model onboarding ─────────────────────────────────────────────────────────
 // Browse Hugging Face, size a quantization plan against real headroom, download,
 // serve, and register. An onboarded model stays unavailable to CSS until measured.
@@ -447,6 +404,89 @@ export function unserveOnboardedModel(modelId) {
 
 export function measureOnboardedModel(modelId, { measurement, basis }) {
   return request(`/api/models/${modelId}/measure`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ measurement, basis }),
+  });
+}
+
+// ── Quantized artifacts ──────────────────────────────────────────────────────
+// A quantized checkpoint is a deliverable on its own. `quantizeModel` runs the
+// pipeline with registration skipped: nothing enters the model zoo, CSS never
+// sees it, and the result is downloadable.
+
+export function quantizeModel(body) {
+  return request("/api/models/quantize", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export function fetchQuantizedArtifacts() {
+  return request("/api/models/artifacts");
+}
+
+/**
+ * Download URL rather than a fetch: these are multi-gigabyte tarballs streamed
+ * from disk, and pulling one through fetch() would buffer the whole checkpoint
+ * in the tab's memory before the user saw a single byte. The browser's own
+ * downloader handles it incrementally.
+ */
+export function artifactDownloadUrl(artifactId) {
+  return `${API_BASE}/api/models/artifacts/${encodeURIComponent(artifactId)}/download`;
+}
+
+export function deleteQuantizedArtifact(artifactId) {
+  return request(`/api/models/artifacts/${encodeURIComponent(artifactId)}`, { method: "DELETE" });
+}
+
+// ── Fine-tuning (/api/finetune) ──────────────────────────────────────────────
+// The counterpart to onboarding: onboarding imports a better rung, fine-tuning
+// makes the existing small one good enough that the router stops escalating.
+// An adapter is not routable until measured — the whole point is that quality
+// changed, so its direction is exactly what cannot be assumed.
+
+export function fetchFinetuneCapability() {
+  return request("/api/finetune/capability");
+}
+
+export function fetchFinetuneDataset() {
+  return request("/api/finetune/dataset");
+}
+
+export function previewFinetunePlan({ baseModelId, method = "qlora", loraRank = 16, epochs = 3 }) {
+  const params = new URLSearchParams({
+    base_model_id: baseModelId,
+    method,
+    lora_rank: String(loraRank),
+    epochs: String(epochs),
+  });
+  return request(`/api/finetune/preview?${params.toString()}`);
+}
+
+export function submitFinetuneJob(body) {
+  return request("/api/finetune/jobs", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+export function fetchFinetuneJobs(limit = 50) {
+  return request(`/api/finetune/jobs?limit=${limit}`);
+}
+
+export function cancelFinetuneJob(jobId) {
+  return request(`/api/finetune/jobs/${encodeURIComponent(jobId)}/cancel`, { method: "POST" });
+}
+
+export function serveFinetuneAdapter(adapterId) {
+  return request(`/api/finetune/adapters/${encodeURIComponent(adapterId)}/serve`, { method: "POST" });
+}
+
+export function measureFinetuneAdapter(adapterId, { measurement, basis }) {
+  return request(`/api/finetune/adapters/${encodeURIComponent(adapterId)}/measure`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ measurement, basis }),

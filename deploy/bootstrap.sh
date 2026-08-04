@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Adaptive Green AI — bootstrap a new environment.
 #
-#   deploy/bootstrap.sh              base stack (chat routing, no agent)
-#   deploy/bootstrap.sh agent        base + Qwen2.5-Coder-1.5B + 7B-AWQ escalation rung
-#   deploy/bootstrap.sh agent stem   + the STEM math rung
+#   deploy/bootstrap.sh                   base stack (chat routing, no coding rung)
+#   deploy/bootstrap.sh stem-coding       + Qwen2.5-Coder-1.5B, the coding rung
+#   deploy/bootstrap.sh stem-coding stem  + the STEM math rung
 #
 # Profiles are additive. The VRAM budget is the hard constraint, not the CPU or
-# the disk: on a 24 GB card the base stack + agent leaves ~3 GB, which is not
-# enough for the Llama-Guard container. See the deploy guide's VRAM table.
+# the disk: on a 24 GB card the base stack + coding rung uses ~13 GB. See the
+# deploy guide's VRAM table.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

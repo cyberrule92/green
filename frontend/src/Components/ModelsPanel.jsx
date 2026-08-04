@@ -39,7 +39,12 @@ import {
   fetchModelRegistry,
   serveOnboardedModel,
   unserveOnboardedModel,
+  quantizeModel,
+  fetchQuantizedArtifacts,
+  artifactDownloadUrl,
+  deleteQuantizedArtifact,
 } from "../lib/api";
+import { FineTunePanel } from "./FineTunePanel";
 
 const PALETTE = {
   primary: "#01a982",
@@ -122,7 +127,7 @@ function Resources({ resources }) {
 }
 
 /** The plan, including what it turned down. */
-function PlanCard({ preview, onOnboard, busy, capability }) {
+function PlanCard({ preview, onOnboard, onQuantizeOnly, busy, capability }) {
   if (!preview) return null;
   const plan = preview.plan || {};
   const admission = preview.admission || {};
@@ -211,8 +216,25 @@ function PlanCard({ preview, onOnboard, busy, capability }) {
         >
           Download, register & serve
         </button>
+        <button
+          disabled={busy || !capability?.local_quantization?.enabled}
+          onClick={onQuantizeOnly}
+          title={
+            capability?.local_quantization?.enabled
+              ? "Runs the calibration pass and stops. Nothing enters the model zoo."
+              : capability?.local_quantization?.reason
+          }
+          style={{
+            background: "transparent", color: PALETTE.deep, border: `1px dashed ${PALETTE.border}`,
+            borderRadius: 8, padding: "8px 16px", fontWeight: 600,
+            cursor: capability?.local_quantization?.enabled && !busy ? "pointer" : "not-allowed",
+          }}
+        >
+          Quantize only (downloadable)
+        </button>
         <span style={{ fontSize: 12, color: PALETTE.soft }}>
-          Registers as <strong>unavailable</strong> — CSS cannot route to it until it is measured.
+          The first two register as <strong>unavailable</strong> — CSS cannot route to them until measured.
+          Quantize-only registers nothing: it produces a checkpoint you can download and run elsewhere.
         </span>
       </div>
     </div>
@@ -229,20 +251,23 @@ export function ModelsPanel() {
   const [busy, setBusy] = useState(false);
   const [jobs, setJobs] = useState([]);
   const [registry, setRegistry] = useState([]);
+  const [artifacts, setArtifacts] = useState([]);
   const [error, setError] = useState(null);
   const [maxModelLen, setMaxModelLen] = useState(2048);
   const [allowLocalQuantize, setAllowLocalQuantize] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
-      const [cap, j, reg] = await Promise.all([
+      const [cap, j, reg, art] = await Promise.all([
         fetchModelCapability(),
         fetchOnboardJobs(20).catch(() => ({ jobs: [] })),
         fetchModelRegistry().catch(() => ({ models: [] })),
+        fetchQuantizedArtifacts().catch(() => ({ artifacts: [] })),
       ]);
       setCapability(cap);
       setJobs(j.jobs || []);
       setRegistry(reg.models || []);
+      setArtifacts(art.artifacts || []);
     } catch (e) {
       setError(String(e.message || e));
     }
@@ -299,6 +324,38 @@ export function ModelsPanel() {
       setError(String(err.message || err));
     } finally {
       setBusy(false);
+    }
+  };
+
+  /**
+   * Quantize and stop. No zoo entry, so CSS never sees the result — the
+   * deliverable is a checkpoint to download, not a routing rung.
+   */
+  const startQuantizeOnly = async () => {
+    if (!preview?.model?.repo_id) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await quantizeModel({
+        repo_id: preview.model.repo_id,
+        max_model_len: maxModelLen,
+        allow_local_quantize: true,
+      });
+      await refresh();
+    } catch (err) {
+      setError(String(err.message || err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const removeArtifact = async (artifactId) => {
+    setError(null);
+    try {
+      await deleteQuantizedArtifact(artifactId);
+      await refresh();
+    } catch (err) {
+      setError(String(err.message || err));
     }
   };
 
@@ -412,7 +469,13 @@ export function ModelsPanel() {
         {previewing && <p style={{ fontSize: 13, color: PALETTE.soft }}>Sizing against this host…</p>}
         {preview && (
           <div style={{ marginTop: 14 }}>
-            <PlanCard preview={preview} onOnboard={startOnboard} busy={busy} capability={capability} />
+            <PlanCard
+              preview={preview}
+              onOnboard={startOnboard}
+              onQuantizeOnly={startQuantizeOnly}
+              busy={busy}
+              capability={capability}
+            />
           </div>
         )}
       </Section>
@@ -441,6 +504,93 @@ export function ModelsPanel() {
               )}
             </div>
           ))}
+        </Section>
+      )}
+
+      {artifacts.length > 0 && (
+        <Section
+          title="Quantized checkpoints"
+          subtitle="Produced here, yours to take. Downloading one does not involve the router."
+        >
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+              <thead>
+                <tr style={{ textAlign: "left", color: PALETTE.soft, fontSize: 12 }}>
+                  <th style={{ padding: "6px 8px" }}>artifact</th>
+                  <th style={{ padding: "6px 8px" }}>format</th>
+                  <th style={{ padding: "6px 8px" }}>size</th>
+                  <th style={{ padding: "6px 8px" }}>cost to make</th>
+                  <th style={{ padding: "6px 8px" }}>in zoo</th>
+                  <th style={{ padding: "6px 8px" }}></th>
+                </tr>
+              </thead>
+              <tbody>
+                {artifacts.map((a) => (
+                  <tr key={a.artifact_id} style={{ borderTop: `1px solid ${PALETTE.border}` }}>
+                    <td style={{ padding: "8px" }}>
+                      <div style={{ fontWeight: 600, color: PALETTE.ink }}>{a.artifact_id}</div>
+                      <div style={{ fontSize: 11, color: PALETTE.soft }}>
+                        from {a.source_repo_id || "unknown"}
+                        {a.calibration_source && ` · calibrated on ${a.calibration_source}`}
+                      </div>
+                    </td>
+                    <td style={{ padding: "8px" }}>
+                      <Pill tone={a.complete ? "ok" : "bad"}>
+                        {a.complete ? `${a.quant_method || "?"}${a.bits ? ` ${a.bits}-bit` : ""}` : "incomplete"}
+                      </Pill>
+                    </td>
+                    <td style={{ padding: "8px" }}>{fmtGb(a.size_gb)}</td>
+                    <td style={{ padding: "8px" }}>
+                      {a.quantization_carbon_g != null ? (
+                        <span title="Measured wall-clock against spec TDP — an upper bound.">
+                          {a.quantization_carbon_g} gCO₂e
+                        </span>
+                      ) : (
+                        <span style={{ color: PALETTE.soft }}>—</span>
+                      )}
+                    </td>
+                    <td style={{ padding: "8px" }}>
+                      <Pill tone={a.in_zoo ? "ok" : "soft"}>{a.in_zoo ? "registered" : "no"}</Pill>
+                    </td>
+                    <td style={{ padding: "8px", textAlign: "right", whiteSpace: "nowrap" }}>
+                      <a
+                        href={a.complete ? artifactDownloadUrl(a.artifact_id) : undefined}
+                        download
+                        title={a.complete ? "Streams as an uncompressed tar" : "A failed pass left this behind; it will not load"}
+                        style={{
+                          display: "inline-block", border: `1px solid ${PALETTE.border}`, borderRadius: 6,
+                          padding: "4px 10px", fontSize: 12, marginRight: 6, textDecoration: "none",
+                          color: a.complete ? PALETTE.deep : "#9bb0ab",
+                          pointerEvents: a.complete ? "auto" : "none",
+                        }}
+                      >
+                        Download
+                      </a>
+                      <button
+                        onClick={() => removeArtifact(a.artifact_id)}
+                        disabled={a.in_zoo}
+                        title={a.in_zoo ? "Registered in the zoo — deregister it first" : "Delete the weights from disk"}
+                        style={{
+                          background: "transparent", border: `1px solid ${PALETTE.border}`, borderRadius: 6,
+                          padding: "4px 10px", fontSize: 12,
+                          color: a.in_zoo ? "#9bb0ab" : PALETTE.danger,
+                          cursor: a.in_zoo ? "not-allowed" : "pointer",
+                        }}
+                      >
+                        Delete
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            <p style={{ fontSize: 12, color: PALETTE.soft, marginTop: 12, marginBottom: 0 }}>
+              Downloads stream as an uncompressed tar — 4-bit safetensors do not compress, and staging a
+              zipped copy would need the disk twice over. The tarball carries a{" "}
+              <code>quantization_manifest.json</code> recording what it came from, what it was calibrated on,
+              and what the pass cost. Upstream licence terms carry over to the quantized weights.
+            </p>
+          </div>
         </Section>
       )}
 
@@ -523,6 +673,10 @@ export function ModelsPanel() {
           </div>
         )}
       </Section>
+
+      {/* The other half of the same problem. Onboarding imports a better rung;
+          fine-tuning makes the one already here good enough to pick. */}
+      <FineTunePanel palette={PALETTE} Section={Section} Pill={Pill} />
     </div>
   );
 }
