@@ -4253,8 +4253,8 @@ async def health_check():
 @app.get("/health/ready")
 async def readiness_check():
     """Readiness probe. Returns 'ok' when store + RAG are up.
-    Triton status is reported separately and does NOT block readiness 
-    the API runs in graceful-degradation mode when Triton has no models.
+    vLLM status is reported separately and does NOT block readiness — the API
+    runs in graceful-degradation mode when no vLLM backend is serving.
     """
     vllm_ready = _is_vllm_live("medium") or _is_vllm_live("full")
 

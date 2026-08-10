@@ -108,11 +108,6 @@ function resolveModelInfo(meta) {
   return name ? { name, variant, escalated, originalVariant } : null;
 }
 
-// Keep backward compat for any callers expecting a string
-function resolveModelName(meta) {
-  return resolveModelInfo(meta)?.name || null;
-}
-
 // ── Live sidebar data hook ────────────────────────────────────────────────────
 function useSidebarData(routerTier = ROUTER_TIER) {
   const [gridData, setGridData] = useState(null);

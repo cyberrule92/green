@@ -96,7 +96,7 @@ function interpAt(points, k) {
   return points[points.length - 1].v;
 }
 
-function drawForecast(canvas, series, liveVal) {
+function drawForecast(canvas, series) {
   const ctx = canvas.getContext('2d');
   const dpr = Math.max(1, window.devicePixelRatio || 1);
   const W = canvas.clientWidth || 600, H = canvas.clientHeight || 260;
@@ -195,8 +195,7 @@ function ForecastChart({ forecast, liveCI }) {
     }
     setMode(m);
 
-    const liveVal = (liveCI != null && Number.isFinite(liveCI)) ? liveCI : series[0].v;
-    const draw = () => drawForecast(canvas, series, liveVal);
+    const draw = () => drawForecast(canvas, series);
     draw();
     const ro = new ResizeObserver(draw);
     ro.observe(canvas);

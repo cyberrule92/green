@@ -4,7 +4,7 @@ import architectureDiagram from "../assets/advanced-rag-architecture.svg";
 const DEPLOYMENT_CARDS = [
   {
     title: "Ubuntu + vGPU",
-    copy: "Triton runs the model pool on NVIDIA-backed Ubuntu infrastructure while the FastAPI control plane manages routing, retrieval, and auditability.",
+    copy: "vLLM serves the model pool on NVIDIA-backed Ubuntu infrastructure while the FastAPI control plane manages routing, retrieval, and auditability.",
   },
   {
     title: "Hybrid Index",

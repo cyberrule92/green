@@ -139,7 +139,7 @@ The decision engine is the central control plane. Every chat request follows thi
 
 | File | Role |
 |---|---|
-| `decision_engine.py` | FastAPI app; 26 endpoints; orchestrates all of the above |
+| `decision_engine.py` | FastAPI app; 71 endpoints; orchestrates all of the above |
 | `routing_policies.py` | CSS scoring, tier policies, semantic prompt profiler, MoE FLOP accounting, multi-region reroute |
 | `advanced_rag.py` | Hybrid retrieval, BM25-like sparse fallback, cross-encoder reranking, chunked JSON store |
 | `rl_controller.py` | Online REINFORCE; persists learned weights to `data/rl_state.json` |
@@ -159,8 +159,8 @@ The decision engine is the central control plane. Every chat request follows thi
 ### Configuration files
 
 - `config/policies.json` — per-tier CSS weight coefficients (standard / premium / esg / batch)
-- `config/routing_targets.json` — routing candidates with baseline accuracy, latency, and power figures. **Not present in the repo**: `load_routing_targets` (`routing_policies.py`) falls back silently to `DEFAULT_ROUTING_TARGETS` defined in that module, which is what actually runs. Create the file (path overridable via `ROUTING_TARGETS_PATH`) only if you need to override those defaults
-- `config/model_zoo.json` — LLMCarbon parameters (FLOPs, HE, PUE, mfg carbon) for each registered model
+- `config/routing_targets.json` — **not present in the repo**, and its absence does *not* fall through to the module defaults. `load_routing_targets` (`routing_policies.py`) walks three tiers: the given path, then **`model_zoo.json` in the same directory**, then `DEFAULT_ROUTING_TARGETS`. Since `config/model_zoo.json` exists, tier two is what actually runs — the live candidate set is its 14-entry `models` list. `DEFAULT_ROUTING_TARGETS` only fires if the zoo is missing or unparseable too, so **editing it will not change routing on a working checkout**. Override the whole chain with `ROUTING_TARGETS_PATH`
+- `config/model_zoo.json` — the routing candidate list *and* the LLMCarbon parameters (FLOPs, HE, PUE, mfg carbon) for each registered model, in one file, which is why the candidates CSS ranks and the carbon model pricing them cannot drift apart. Routing reads accuracy/latency/power via the `accuracy_baseline` / `latency_ms_p50` / `power_tdp_w` keys (`rank_routing_candidates` accepts either those or the flat `accuracy` / `latency_ms` / `power_w` names `DEFAULT_ROUTING_TARGETS` uses). Candidates are filtered on modality, on `available`, and on the request's `accuracy_floor` before scoring; that floor filter is permissive on empty — if nothing clears it, the unconstrained set is scored instead, which is the only case where the `-0.18` accuracy penalty is not redundant with the filter
 - `guardrails/config.yml` — NemoGuardrails action mapping (no ColBERT / external LLM)
 
 ### Frontend
@@ -187,7 +187,10 @@ data/
 
 | Variable | Purpose |
 |---|---|
-| `TRITON_MEDIUM_MODEL`, `TRITON_FULL_MODEL` | vLLM endpoint URLs |
+| `VLLM_MEDIUM_URL`, `VLLM_FULL_URL` | The two required vLLM endpoints. `ultra-light` and `medium` both dispatch to `VLLM_MEDIUM_URL` — that shared backend is the measured negative result `model_onboarding.py` exists to fix |
+| `VLLM_MOE_URL`, `VLLM_STEM_MATH_URL`, `VLLM_STEM_SCIENCE_URL`, `VLLM_STEM_CODING_URL`, `VLLM_FALLBACK_URL` | Optional dedicated endpoints; each **defaults to `VLLM_FULL_URL`**, so a single-container deploy still routes. A STEM steer that looks like it did nothing is usually this default, not the steer |
+| `VLLM_TIMEOUT_SECONDS` | Per-request inference timeout (default 45 s), tuned for chat where a user is waiting |
+| ~~`TRITON_*`~~ | **Dead — removed from `.env.example` 2026-08-10.** Triton Inference Server is not used anywhere; serving is vLLM's OpenAI-compatible server end to end. Older `.env` files may still carry `TRITON_TIMEOUT_SECONDS`, `TRITON_READY_WAIT_SECONDS`, `TRITON_{ULTRA_LIGHT,MEDIUM,FULL,MOE}_MODEL` — **no Python ever read them**, and they held model *names*, never URLs. Don't reintroduce them when reconciling an old env file |
 | `EMAP_TOKEN`, `EMAP_ZONE` | Electricity Maps API credentials + primary grid zone |
 | `GPU_TDP`, `GPU_VRAM_GB` | Hardware spec for LLMCarbon calculations |
 | `RL_ALPHA_0`, `RL_REWARD_LAMBDA_*` | RL learning rate and reward component weights |

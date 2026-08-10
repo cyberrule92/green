@@ -230,7 +230,6 @@ function LatencyHeatmap({ heatmap }) {
   const { cells, lat_bin_edges_ms, col_starts, max_count } = heatmap;
   const cols = cells[0]?.length || 0;
   if (cols === 0) return <div style={{ color: PALETTE.soft }}>No data</div>;
-  const cellW = 100 / cols;
   const rows = cells.length;
   const cellH = 18;
   const W = 800;
@@ -731,7 +730,10 @@ export function ObservabilityPanel() {
   const deltas = data?.deltas || {};
   const dist = data?.distributions || {};
   const series = data?.time_series || [];
-  const traces = data?.traces || [];
+  // Memoised so the `|| []` fallback does not mint a fresh array identity on
+  // every render, which would defeat the useMemo below and re-filter the whole
+  // trace list each time.
+  const traces = useMemo(() => data?.traces || [], [data?.traces]);
 
   const filteredTraces = useMemo(() => {
     return traces.filter(t => {
